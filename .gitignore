@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# uv / virtualenv
+.venv/
+
+# External model/library clones (not vendored in this repo)
+/mink/
+/mujoco_menagerie/
+
+# Generated artifacts (regenerate via demos/)
+demos/*.png
+demos/*.mp4
+
+# Local tooling / OS
+.claude/
+.DS_Store
