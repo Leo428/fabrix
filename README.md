@@ -40,7 +40,7 @@ uv run python demos/attractor_reach.py    # reach demo -> demos/attractor_reach.
 
 | path | contents |
 |---|---|
-| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`, `MJXProvider`), `maps`, `leaves`, `fabric`, `integrate` |
+| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`), `maps`, `leaves`, `fabric`, `integrate` |
 | `demos/` | runnable demos |
 | `tests/` | pytest suite |
 | `experiments/` | de-risking scratch (autodiff-FK correctness + latency studies) |

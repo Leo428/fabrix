@@ -1,15 +1,13 @@
-"""Kinematics providers: ``q -> site world position`` as a differentiable JAX function.
+"""Kinematics provider: ``q -> site world position`` as a differentiable JAX function.
 
-Two interchangeable implementations behind one :class:`KinematicsProvider` Protocol:
+:class:`CustomFK` is a lean vectorized serial-chain FK (the real-time provider; ~8 us / FK,
+~27 us / curvature term), built purely from the model's joint frames with no scalar packing. It
+is differentiable, so ``J`` and ``Jdot @ qdot`` come from autodiff (see ``fabrix.diff``).
 
-- :class:`CustomFK`  — a lean vectorized serial-chain FK (the real-time provider; ~8 us / FK,
-  ~27 us / curvature term). Built purely from the model's joint frames, no scalar packing.
-- :class:`MJXProvider` — a thin wrapper over ``mjx.kinematics`` (correct + general "load any
-  MJCF", but ~ms single-instance on CPU; for batched/GPU or non-serial models).
-
-Both are differentiable, so ``J`` and ``Jdot @ qdot`` come from autodiff (see ``fabrix.diff``).
-A provider is constructed once and closed over by the fabric; ``self`` is static under jit and
-the model arrays bake into the compiled graph.
+It sits behind the :class:`KinematicsProvider` Protocol, so an alternative backend (e.g. an MJX
+wrapper for non-serial models or batched/GPU use) can be dropped in without touching the fabric.
+A provider is constructed once and closed over by the fabric; ``self`` is static under jit and the
+model arrays bake into the compiled graph.
 """
 from __future__ import annotations
 
@@ -18,7 +16,6 @@ from typing import Optional, Protocol
 import jax.numpy as jnp
 import mujoco
 import numpy as np
-from mujoco import mjx
 
 
 class KinematicsProvider(Protocol):
@@ -119,19 +116,3 @@ class CustomFK:
 
     def site_pos(self, q: jnp.ndarray) -> jnp.ndarray:
         return self._fk(q)
-
-
-class MJXProvider:
-    """Forward kinematics via MJX. General (any MJCF) but slow single-instance on CPU."""
-
-    def __init__(self, xml_path: str, site_name: Optional[str] = None):
-        m = mujoco.MjModel.from_xml_path(xml_path)
-        self.mj_model = m
-        self.site_id = _resolve_site(m, site_name)
-        self.nq = m.nq
-        self._model = mjx.put_model(m)
-        self._data0 = mjx.make_data(self._model)
-
-    def site_pos(self, q: jnp.ndarray) -> jnp.ndarray:
-        d = mjx.kinematics(self._model, self._data0.replace(qpos=q))
-        return d.site_xpos[self.site_id]

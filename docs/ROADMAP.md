@@ -22,8 +22,9 @@ Every fabric operation is a derivative-of-a-derivative; autodiff supplies them:
 - Validated: `J` vs `mj_jacSite` = **6e-16**; `J̇q̇` vs finite-diff = **2e-10**.
 - Speed: vectorized custom FK `fk` ~8 µs, `J̇q̇` ~27 µs; JAX CPU **dispatch floor ~1.6 µs**
   → single-arm real-time from Python on CPU is feasible.
-- **MJX** is correct but ~100 ms single-instance on CPU → it's a *batched-GPU / general-model*
-  tool, not the real-time provider.
+- **MJX** was evaluated — correct, but ~100 ms single-instance on CPU → a *batched-GPU /
+  general-model* tool, not a real-time provider. Since M1–M3 run on the Gen3 via `CustomFK`, the
+  `mujoco-mjx` dependency was dropped; the `KinematicsProvider` Protocol keeps re-adding it cheap.
 - **Burned-in lesson:** never build vectors with `jnp.array([scalar, …])` — it compiles to
   thousands of scalar ops (~**1000× slowdown**). Use slicing + vectorized ops + `concatenate`.
 
@@ -44,8 +45,9 @@ Specs to config space; `combine` sums them; `resolve` solves for `q̈`.
 - **Spec algebra** (`fabrix/spec.py`): `pullback(s, J, Jdq) = Spec(JᵀMJ, Jᵀ(f + M·Jdq))` — the
   `M·J̇q̇` curvature term is what makes it correct. `combine` = (ΣM, Σf). `resolve` = Cholesky.
 - **Derivatives** (`fabrix/diff.py`): `value_jac_curv(phi, q, qd) -> (x, J, Jdq)`.
-- **Kinematics** (`fabrix/kinematics.py`): `KinematicsProvider` Protocol; `CustomFK` (vectorized
-  serial-chain FK, real-time); `MJXProvider` (general).
+- **Kinematics** (`fabrix/kinematics.py`): `KinematicsProvider` Protocol + `CustomFK` (vectorized
+  serial-chain FK, the real-time provider). The Protocol leaves room for an alternative backend
+  (e.g. an MJX wrapper for non-serial / batched use) without touching the fabric.
 - **Leaves** (`fabrix/leaves.py`): the pattern is **`f = -M @ a_des`** — the leaf's isolated
   acceleration is exactly `a_des`, and the **metric `M` sets task priority** in the combination.
   This is what gives precise EE convergence without posture bias. `attractor` (task-space, large

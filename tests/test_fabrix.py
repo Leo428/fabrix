@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from fabrix import (
-    CustomFK, Fabric, FabricParams, MJXProvider, Spec, attractor, combine,
+    CustomFK, Fabric, FabricParams, Spec, attractor, combine,
     config_damping, posture, pullback, resolve, rollout, value_jac_curv,
 )
 
@@ -60,14 +60,6 @@ def test_customfk_matches_mujoco(prov64):
         gt = _mj_site(prov64.mj_model, prov64.site_id, q)
         got = np.asarray(prov64.site_pos(jnp.array(q)))
         assert np.abs(got - gt).max() < 1e-10
-
-
-def test_mjx_matches_mujoco():
-    p = MJXProvider(XML)
-    q = np.random.default_rng(1).uniform(-1, 1, p.nq)
-    gt = _mj_site(p.mj_model, p.site_id, q)
-    got = np.asarray(p.site_pos(jnp.array(q)))
-    assert np.abs(got - gt).max() < 1e-5
 
 
 def test_curvature_vs_finitediff(prov64):
