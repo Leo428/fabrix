@@ -37,6 +37,10 @@ class KinematicsProvider(Protocol):
         """World ``(position (3,), quaternion (4,) wxyz)`` of the tracked site."""
         ...
 
+    def body_poses(self, q: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """World ``(positions (nbody,3), quaternions (nbody,4) wxyz)`` of every body frame."""
+        ...
+
 
 def _resolve_site(model: mujoco.MjModel, site_name: Optional[str]) -> int:
     if site_name is None:
@@ -101,8 +105,12 @@ class CustomFK:
         ident_q = jnp.array([1.0, 0.0, 0.0, 0.0], dtype)
         zero3 = jnp.zeros(3, dtype)
 
-        def bodies(q):
-            """World ``(position, quaternion)`` of the *body* the site is attached to."""
+        def all_bodies(q):
+            """World ``(position, quaternion)`` of *every* body frame, as lists indexed by body id.
+
+            The body-tree loop unrolls over the model's static topology. The hot path (:func:`bodies`)
+            indexes the site body; whole-arm consumers (collision) stack the lists via ``body_poses``.
+            """
             pw = [zero3] * self._nbody          # world position of each body frame
             qw = [ident_q] * self._nbody        # world orientation (quat) of each body frame
             for b in range(1, self._nbody):
@@ -117,6 +125,11 @@ class CustomFK:
                     wq = _qmul(wq, jq)
                 pw[b] = wp
                 qw[b] = wq
+            return pw, qw
+
+        def bodies(q):
+            """World ``(position, quaternion)`` of the *body* the site is attached to (hot path)."""
+            pw, qw = all_bodies(q)
             return pw[self._site_body], qw[self._site_body]
 
         def fk_pos(q):
@@ -127,8 +140,13 @@ class CustomFK:
             pb, qb = bodies(q)
             return pb + _qrot(qb, spos), _qmul(qb, squat)
 
+        def fk_body_poses(q):
+            pw, qw = all_bodies(q)
+            return jnp.stack(pw), jnp.stack(qw)   # (nbody,3), (nbody,4)
+
         self._fk = fk_pos
         self._fk_pose = fk_pose
+        self._fk_body_poses = fk_body_poses
         self.mj_model = m
         self.site_id = site
         self.nq = m.nq
@@ -143,3 +161,12 @@ class CustomFK:
     def site_pose(self, q: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """World ``(position (3,), quaternion (4,) wxyz)`` of the tracked site."""
         return self._fk_pose(q)
+
+    def body_poses(self, q: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """World ``(positions (nbody,3), quaternions (nbody,4) wxyz)`` of every body frame.
+
+        For whole-arm consumers (collision spheres): the body-tree loop already computes each body's
+        world frame to place its children; this just stacks them. ``body 0`` is the world frame
+        (identity). Within a jitted policy this loop is CSE-shared with ``site_pos``/``site_pose``.
+        """
+        return self._fk_body_poses(q)

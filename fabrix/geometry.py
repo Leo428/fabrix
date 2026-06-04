@@ -25,7 +25,7 @@ import numpy as np
 
 from fabrix.diff import value_jac_curv
 from fabrix.maps import plane_sdf_map, sphere_sdf_map
-from fabrix.spec import Spec, pullback
+from fabrix.spec import Spec
 
 
 def energize(a_g, v, M_e, f_e, eps: float = 1e-8):
@@ -91,6 +91,22 @@ def _barrier_potential_grad(d, k_p: float, d0: float):
     return k_p * s * (-1.0 / (d * d)) * active
 
 
+def _pullback_diag(J, Jdq, m, f) -> Spec:
+    """Pull back a *batch* of independent 1-D barrier specs sharing a diagonal task metric.
+
+    For ``k`` scalar tasks stacked into ``(k,)`` — Jacobian ``J`` (k,nq), curvature ``Jdq`` (k,),
+    diagonal task metric ``diag(m)`` and task force ``f`` (k,) — summing the per-task pullbacks
+    ``Jᵢᵀ mᵢ Jᵢ`` and ``Jᵢᵀ(fᵢ + mᵢ Jdqᵢ)`` gives, without ever forming the dense ``(k,k)`` metric,
+
+        M_q = Jᵀ diag(m) J = J.T @ (m[:, None] * J),      f_q = Jᵀ (f + m ⊙ Jdq).
+
+    For ``k = 1`` this equals :func:`fabrix.spec.pullback` of the scalar barrier spec, so the single
+    obstacle/plane/joint barriers are bit-identical; for ``k > 1`` it is the batched barrier (one FK +
+    one Jacobian shared across all ``k`` distances — see :mod:`fabrix.collision`).
+    """
+    return Spec(J.T @ (m[:, None] * J), J.T @ (f + m * Jdq))
+
+
 def joint_limit_geometry(provider, k_b: float = 0.4, power: float = 2.0, m_b: float = 1.0,
                          margin: float = 0.0, eps: float = 1e-3):
     """Barrier geometry that keeps each *limited* joint inside its range.
@@ -133,12 +149,17 @@ def joint_limit_geometry(provider, k_b: float = 0.4, power: float = 2.0, m_b: fl
 
 def sdf_barrier_geometry(dist, k_b: float = 1.0, power: float = 2.0, m_b: float = 2.0,
                          d0: Optional[float] = None, margin: float = 0.0, eps: float = 1e-3):
-    """Barrier *geometry* on any signed-distance field ``dist(q, params) -> (1,)``.
+    """Barrier *geometry* on any signed-distance field ``dist(q, params) -> (k,)``, ``k >= 1``.
 
-    The shared core of obstacle/plane avoidance: a 1-D HD2 barrier on the distance, repelling while
-    the site approaches the surface, pulled back to config space through the distance Jacobian (with
-    its curvature term). ``dist`` is passed ``params`` too, so the surface can move at runtime (a
-    traced obstacle center) with no structural change — autodiff differentiates ``q`` only.
+    The shared core of obstacle/plane/self-collision avoidance: an HD2 barrier on each distance,
+    repelling while the site approaches that surface, pulled back to config space through the distance
+    Jacobian (with its curvature term). ``dist`` is passed ``params`` too, so a surface can move at
+    runtime (a traced obstacle center) with no structural change — autodiff differentiates ``q`` only.
+
+    When ``dist`` returns a vector (``k > 1``) this is a single **batched** barrier: one FK and one
+    Jacobian feed all ``k`` distances, and the ``k`` per-task pullbacks are summed in closed form
+    (:func:`_pullback_diag`) — the efficient way to run many barriers (e.g. collision-sphere pairs),
+    far cheaper than ``k`` separate leaves. ``k = 1`` is the original single-surface barrier, unchanged.
 
     ``d0`` optionally localizes the deflection: the priority *metric* is faded out (smooth C1 band)
     beyond ``d0`` of the surface, so the geometry only bends the path within that range. Without it
@@ -148,14 +169,14 @@ def sdf_barrier_geometry(dist, k_b: float = 1.0, power: float = 2.0, m_b: float 
 
     def leaf(q, qd, params):
         phi = lambda qq: dist(qq, params)                       # noqa: E731  (q-only for autodiff)
-        x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(1,) J:(1,nq) Jdq:(1,)
-        d = jnp.clip(x[0] - margin, eps, None)
-        dd = (J @ qd)[0]
-        a_g = _barrier_accel(d, dd, k_b, power)                 # scalar, away from surface (+d)
-        m = _barrier_metric(d, dd, m_b)                         # scalar priority weight
+        x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(k,) J:(k,nq) Jdq:(k,)
+        d = jnp.clip(x - margin, eps, None)                     # (k,)
+        dd = J @ qd                                             # (k,) d/dt of each distance
+        a_g = _barrier_accel(d, dd, k_b, power)                 # (k,) accel away from each surface
+        m = _barrier_metric(d, dd, m_b)                         # (k,) per-surface priority weight
         if d0 is not None:
             m = m * _band(d, d0)                                # fade priority out beyond d0
-        return pullback(Spec(m.reshape(1, 1), (-m * a_g).reshape(1)), J, Jdq)
+        return _pullback_diag(J, Jdq, m, -m * a_g)              # = -M a_des, batched over k
 
     return leaf
 
@@ -234,21 +255,22 @@ def joint_limit_potential(provider, k_p: float = 0.05, d0: float = 0.3, m_p: flo
 
 def sdf_barrier_potential(dist, k_p: float = 0.5, d0: float = 0.2, m_p: float = 4.0,
                           margin: float = 0.0, eps: float = 1e-3):
-    """Repulsive barrier *potential* on any signed-distance field ``dist(q, params) -> (1,)``.
+    """Repulsive barrier *potential* on any signed-distance field ``dist(q, params) -> (k,)``, ``k >= 1``.
 
-    The shared core of the obstacle/plane potentials: a diverging potential force on the distance,
-    localized to the standoff band ``d0``. This — not the geometry — makes the clearance a hard
-    invariant (the diverging potential is unreachable with finite kinetic energy). Pair with the
-    matching geometry. ``dist`` is passed ``params`` so the surface can move at runtime.
+    The shared core of the obstacle/plane/self-collision potentials: a diverging potential force on
+    each distance, localized to the standoff band ``d0``. This — not the geometry — makes the clearance
+    a hard invariant (the diverging potential is unreachable with finite kinetic energy). Pair with the
+    matching geometry. ``dist`` is passed ``params`` so a surface can move at runtime; a vector ``dist``
+    (``k > 1``) is one **batched** potential over all ``k`` distances (see :func:`sdf_barrier_geometry`).
     """
 
     def leaf(q, qd, params):
         phi = lambda qq: dist(qq, params)                       # noqa: E731  (q-only for autodiff)
-        x, J, Jdq = value_jac_curv(phi, q, qd)
-        d = jnp.clip(x[0] - margin, eps, None)
-        f = _barrier_potential_grad(d, k_p, d0).reshape(1)      # task-space potential force
-        m = (m_p * _band(d, d0)).reshape(1, 1)                  # smooth standoff envelope
-        return pullback(Spec(m, f), J, Jdq)
+        x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(k,) J:(k,nq) Jdq:(k,)
+        d = jnp.clip(x - margin, eps, None)                     # (k,)
+        f = _barrier_potential_grad(d, k_p, d0)                 # (k,) diverging task-space forces
+        m = m_p * _band(d, d0)                                  # (k,) smooth standoff envelope
+        return _pullback_diag(J, Jdq, m, f)                     # batched over k
 
     return leaf
 
