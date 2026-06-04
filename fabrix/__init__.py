@@ -12,16 +12,18 @@ from fabrix.geometry import (
 )
 from fabrix.integrate import rollout, step
 from fabrix.kinematics import CustomFK, KinematicsProvider
-from fabrix.leaves import attractor, config_damping, posture
-from fabrix.maps import plane_sdf_map, site_position_map, sphere_sdf_map
+from fabrix.leaves import attractor, config_damping, pose_attractor, posture
+from fabrix.maps import (
+    plane_sdf_map, se3_pose_error_map, site_position_map, sphere_sdf_map,
+)
 from fabrix.spec import Spec, combine, pullback, resolve
 
 __all__ = [
     "Spec", "pullback", "combine", "resolve",
     "value_jac_curv",
     "KinematicsProvider", "CustomFK",
-    "site_position_map", "sphere_sdf_map", "plane_sdf_map",
-    "attractor", "posture", "config_damping",
+    "site_position_map", "sphere_sdf_map", "plane_sdf_map", "se3_pose_error_map",
+    "attractor", "pose_attractor", "posture", "config_damping",
     "energy_spec", "fixed_metric_energy", "lagrangian_energy",
     "energize", "joint_limit_geometry", "joint_limit_potential",
     "obstacle_geometry", "obstacle_potential",

@@ -17,7 +17,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from fabrix.diff import value_jac_curv
-from fabrix.maps import site_position_map
+from fabrix.maps import se3_pose_error_map, site_position_map
 from fabrix.spec import Spec, pullback
 
 
@@ -34,6 +34,27 @@ def attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0):
         xd = J @ qd
         M = m * jnp.eye(3, dtype=x.dtype)
         f = m * (k * (x - params.target) + b * xd)  # = -M @ a_des
+        return pullback(Spec(M, f), J, Jdq)
+
+    return leaf
+
+
+def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0):
+    """Full 6-DOF SE(3) pose attractor. Drives the coupled pose error to zero.
+
+    Task = ``e(q) = Log(T*^{-1} T(q)) in se(3)`` (``params.target`` position + ``params.target_quat``
+    orientation, wxyz). Desired accel ``-(k e + b ė)``; priority metric ``m·I₆`` (one shared metric
+    over the 6 twist coordinates, the coupled-SE(3) choice). ``f = M @ (k e + b ė)`` pulled back to
+    config space. Use alongside :func:`posture`/:func:`config_damping` to resolve the arm's
+    redundancy; the error couples translation and rotation, so the approach is a geodesic screw.
+    """
+
+    def leaf(q, qd, params):
+        phi = se3_pose_error_map(provider, params.target, params.target_quat)
+        e, J, Jdq = value_jac_curv(phi, q, qd)
+        ed = J @ qd
+        M = m * jnp.eye(6, dtype=e.dtype)
+        f = m * (k * e + b * ed)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
     return leaf

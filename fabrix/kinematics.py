@@ -1,4 +1,4 @@
-"""Kinematics provider: ``q -> site world position`` as a differentiable JAX function.
+"""Kinematics provider: ``q -> site world pose`` as a differentiable JAX function.
 
 :class:`CustomFK` is a lean vectorized serial-chain FK (the real-time provider; ~8 us / FK,
 ~27 us / curvature term), built purely from the model's joint frames with no scalar packing. It
@@ -8,10 +8,14 @@ It sits behind the :class:`KinematicsProvider` Protocol, so an alternative backe
 wrapper for non-serial models or batched/GPU use) can be dropped in without touching the fabric.
 A provider is constructed once and closed over by the fabric; ``self`` is static under jit and the
 model arrays bake into the compiled graph.
+
+Orientation (``site_rot`` / ``site_pose``) is nearly free: the body-tree loop already carries each
+body's world quaternion (it needs them to place children), so the site's world orientation is one
+extra quaternion product. The position-only ``site_pos`` hot path shares the same loop unchanged.
 """
 from __future__ import annotations
 
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Tuple
 
 import jax.numpy as jnp
 import mujoco
@@ -19,7 +23,7 @@ import numpy as np
 
 
 class KinematicsProvider(Protocol):
-    """Minimal kinematics interface used by task maps (M3 will add ``site_pose``)."""
+    """Minimal kinematics interface used by task maps. Quaternions are ``(4,)`` wxyz (MuJoCo)."""
 
     mj_model: mujoco.MjModel
     site_id: int
@@ -27,6 +31,10 @@ class KinematicsProvider(Protocol):
 
     def site_pos(self, q: jnp.ndarray) -> jnp.ndarray:
         """World position (3,) of the tracked site for configuration ``q`` (nq,)."""
+        ...
+
+    def site_pose(self, q: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """World ``(position (3,), quaternion (4,) wxyz)`` of the tracked site."""
         ...
 
 
@@ -89,10 +97,12 @@ class CustomFK:
         jaxis = jnp.array(m.jnt_axis, dtype)
         jpos = jnp.array(m.jnt_pos, dtype)
         spos = jnp.array(m.site_pos[site], dtype)
+        squat = jnp.array(m.site_quat[site], dtype)   # site frame relative to its body (wxyz)
         ident_q = jnp.array([1.0, 0.0, 0.0, 0.0], dtype)
         zero3 = jnp.zeros(3, dtype)
 
-        def fk(q):
+        def bodies(q):
+            """World ``(position, quaternion)`` of the *body* the site is attached to."""
             pw = [zero3] * self._nbody          # world position of each body frame
             qw = [ident_q] * self._nbody        # world orientation (quat) of each body frame
             for b in range(1, self._nbody):
@@ -107,12 +117,29 @@ class CustomFK:
                     wq = _qmul(wq, jq)
                 pw[b] = wp
                 qw[b] = wq
-            return pw[self._site_body] + _qrot(qw[self._site_body], spos)
+            return pw[self._site_body], qw[self._site_body]
 
-        self._fk = fk
+        def fk_pos(q):
+            pb, qb = bodies(q)
+            return pb + _qrot(qb, spos)
+
+        def fk_pose(q):
+            pb, qb = bodies(q)
+            return pb + _qrot(qb, spos), _qmul(qb, squat)
+
+        self._fk = fk_pos
+        self._fk_pose = fk_pose
         self.mj_model = m
         self.site_id = site
         self.nq = m.nq
 
     def site_pos(self, q: jnp.ndarray) -> jnp.ndarray:
         return self._fk(q)
+
+    def site_rot(self, q: jnp.ndarray) -> jnp.ndarray:
+        """World orientation quaternion (4,) wxyz of the tracked site."""
+        return self._fk_pose(q)[1]
+
+    def site_pose(self, q: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """World ``(position (3,), quaternion (4,) wxyz)`` of the tracked site."""
+        return self._fk_pose(q)

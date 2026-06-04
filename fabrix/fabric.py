@@ -6,6 +6,8 @@ real-time loop pays a single dispatch per tick.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import jax_dataclasses as jdc
@@ -20,6 +22,10 @@ class FabricParams:
 
     target: jnp.ndarray     # (3,) end-effector position target
     q_default: jnp.ndarray  # (nq,) nominal posture for redundancy resolution
+    # (4,) wxyz orientation target for the SE(3) pose_attractor; identity default so
+    # position-only fabrics (M1/M2) need not supply it.
+    target_quat: jnp.ndarray = dataclasses.field(
+        default_factory=lambda: jnp.array([1.0, 0.0, 0.0, 0.0]))
 
 
 class Fabric:

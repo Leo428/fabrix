@@ -11,6 +11,16 @@ from __future__ import annotations
 from typing import Optional
 
 import jax.numpy as jnp
+import jaxlie
+
+
+def _se3(pos, quat_wxyz):
+    """Build a ``jaxlie.SE3`` from a position and a wxyz quaternion (MuJoCo convention).
+
+    jaxlie stores rotations as xyzw, so the scalar ``w`` is rolled to the back.
+    """
+    rot = jaxlie.SO3.from_quaternion_xyzw(jnp.concatenate([quat_wxyz[1:], quat_wxyz[:1]]))
+    return jaxlie.SE3.from_rotation_and_translation(rot, pos)
 
 
 def site_position_map(provider):
@@ -49,5 +59,26 @@ def plane_sdf_map(provider, point, normal, site_name: Optional[str] = None):
     def phi(q):
         p = provider.site_pos(q)
         return jnp.dot(p - p0, n).reshape(1)
+
+    return phi
+
+
+def se3_pose_error_map(provider, target_pos, target_quat):
+    """Full-pose error map ``phi(q) = Log(T_target^{-1} T_current(q)) in se(3)``, shape ``(6,)``.
+
+    A coupled SE(3) pose error: zero exactly when the tracked site reaches the target pose, and a
+    geodesic (screw) twist otherwise. ``target_pos``/``target_quat`` (wxyz) are held fixed, so the
+    autodiff Jacobian and curvature term differentiate through ``T_current(q)`` only. jaxlie's Log
+    has a Taylor fallback at the identity, so ``J``/``Jdq`` stay finite as the error -> 0.
+
+    Tangent ordering follows jaxlie's SE3: ``[v_translation (3), w_rotation (3)]``.
+    """
+    T_tgt_inv = _se3(target_pos, target_quat).inverse()
+
+    def phi(q):
+        p, quat = provider.site_pose(q)
+        # jaxlie carries float64 constants; under jax_enable_x64 that would promote a float32 config
+        # to float64 (e.g. breaking a float32 scan carry). Anchor the error to the config dtype.
+        return (T_tgt_inv @ _se3(p, quat)).log().astype(q.dtype)
 
     return phi
