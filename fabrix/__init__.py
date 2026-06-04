@@ -4,19 +4,27 @@ Milestone 1: forced attractor fabric. Public surface grows as milestones land.
 """
 
 from fabrix.diff import value_jac_curv
-from fabrix.fabric import Fabric, FabricParams
+from fabrix.energy import energy_spec, fixed_metric_energy, lagrangian_energy
+from fabrix.fabric import Fabric, FabricParams, GeometricFabric
+from fabrix.geometry import (
+    energize, joint_limit_geometry, joint_limit_potential, obstacle_geometry,
+    obstacle_potential,
+)
 from fabrix.integrate import rollout, step
 from fabrix.kinematics import CustomFK, KinematicsProvider
 from fabrix.leaves import attractor, config_damping, posture
-from fabrix.maps import site_position_map
+from fabrix.maps import plane_sdf_map, site_position_map, sphere_sdf_map
 from fabrix.spec import Spec, combine, pullback, resolve
 
 __all__ = [
     "Spec", "pullback", "combine", "resolve",
     "value_jac_curv",
     "KinematicsProvider", "CustomFK",
-    "site_position_map",
+    "site_position_map", "sphere_sdf_map", "plane_sdf_map",
     "attractor", "posture", "config_damping",
-    "Fabric", "FabricParams",
+    "energy_spec", "fixed_metric_energy", "lagrangian_energy",
+    "energize", "joint_limit_geometry", "joint_limit_potential",
+    "obstacle_geometry", "obstacle_potential",
+    "Fabric", "FabricParams", "GeometricFabric",
     "step", "rollout",
 ]

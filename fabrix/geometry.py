@@ -1,0 +1,212 @@
+"""HD2 geometries, the energization operator, and barrier geometry leaves.
+
+A *geometry* produces a speed-independent path: an acceleration ``a_g(x, xd)`` homogeneous of
+degree 2 (HD2) in ``xd``, so rescaling speed retraces the same path. **Energization** adds a
+force purely along ``xd`` to make a geometry conserve a Finsler energy (:mod:`fabrix.energy`),
+turning a bare path into a stable, speed-regulated fabric.
+
+**Why energize at the root.** A barrier lives in a 1-D leaf space, where energization is
+degenerate: any 1-D acceleration changes speed, so the energy-conserving projection has no room
+to act and would cancel the geometry entirely. So bare geometries are pulled back and *combined*
+at the root (config space, n-D), and the combined geometry is energized there — where the
+projection orthogonal to ``qd`` is nontrivial. :class:`fabrix.fabric.GeometricFabric` wires this.
+
+**Barriers.** A barrier is an HD2 geometry whose acceleration ``k_b xd^2 / d^p`` blows up as the
+distance ``d`` to a limit/obstacle goes to zero, gated to act only while *approaching*
+(``xd < 0``). The blow-up is what makes the constraint invariant (you cannot reach ``d = 0`` from
+``d > 0`` — the deceleration diverges first); energization keeps the barrier from injecting energy.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+import jax.numpy as jnp
+import numpy as np
+
+from fabrix.diff import value_jac_curv
+from fabrix.maps import sphere_sdf_map
+from fabrix.spec import Spec, pullback
+
+
+def energize(a_g, v, M_e, f_e, eps: float = 1e-8):
+    """Energize a geometry acceleration ``a_g`` to conserve the energy with spec ``(M_e, f_e)``.
+
+    Adds the unique multiple of the velocity ``v`` that zeroes the energy rate
+    ``v^T (M_e a + f_e)``:
+
+        a = a_g - [ v^T (M_e a_g + f_e) / (v^T M_e v) ] v.
+
+    By construction ``v^T (M_e a + f_e) = 0``, so the energy is conserved *exactly* in continuous
+    time. The correction is along ``v`` only, so the geometry's path is preserved — energization
+    regulates speed, it does not bend the path. ``eps`` floors the ``v^T M_e v -> 0`` (near-rest)
+    singularity; at rest the correction is harmless (numerator -> 0 with no motion to conserve).
+    """
+    Mv = M_e @ v
+    alpha = (v @ (M_e @ a_g + f_e)) / (v @ Mv + eps)
+    return a_g - alpha * v
+
+
+def _barrier_accel(d, dd, k_b: float, power: float):
+    """HD2 repulsion ``k_b dd^2 / d^p`` along +d, active only while approaching (``dd < 0``).
+
+    ``dd^2`` is HD2 in velocity and the ``dd < 0`` switch is sign-only (homogeneous degree 0), so
+    the product is HD2 and ``C1`` at ``dd = 0`` (it vanishes there). Returns the +``d`` acceleration.
+    """
+    approaching = (dd < 0.0).astype(d.dtype)
+    return k_b * (dd * dd) / d**power * approaching
+
+
+def _barrier_metric(d, dd, m_b: float):
+    """Barrier priority metric ``m_b / d`` while approaching, else 0.
+
+    Grows as the boundary nears so the about-to-be-violated constraint dominates the
+    metric-weighted geometry combination; vanishes when moving away so it never fights free motion.
+    """
+    approaching = (dd < 0.0).astype(d.dtype)
+    return m_b / d * approaching
+
+
+def _band(d, d0: float):
+    """C1 standoff envelope in [0, 1]: 1 at the boundary, smoothly 0 at and beyond ``d0``.
+
+    Fades a barrier *potential*'s metric in/out across the standoff band without the metric jump
+    (and resulting q_ddot step) a hard ``d < d0`` switch would inject into the root solve.
+    """
+    r = jnp.clip(1.0 - d / d0, 0.0, 1.0)
+    return r * r
+
+
+def _barrier_potential_grad(d, k_p: float, d0: float):
+    """``d(psi)/dd`` for the localized barrier potential ``psi = 1/2 k_p (1/d - 1/d0)^2`` (d < d0).
+
+    The potential diverges as ``d -> 0`` and is ``0`` (value and slope) at ``d = d0``, so it acts
+    only inside the standoff band ``d0``. The gradient is ``<= 0``, so the resulting force
+    ``-dpsi/dd >= 0`` always pushes toward larger ``d`` (away from the boundary). This is what makes
+    the constraint a hard invariant: with bounded kinetic energy, the diverging potential is
+    unreachable, so ``d`` cannot reach ``0``. Energy-conserving geometries can deflect but not
+    stop a head-on approach — only a potential like this (or dissipation) can.
+    """
+    active = (d < d0).astype(d.dtype)
+    s = 1.0 / d - 1.0 / d0
+    return k_p * s * (-1.0 / (d * d)) * active
+
+
+def joint_limit_geometry(provider, k_b: float = 0.4, power: float = 2.0, m_b: float = 1.0,
+                         margin: float = 0.0, eps: float = 1e-3):
+    """Barrier geometry that keeps each *limited* joint inside its range.
+
+    For joint ``j`` with range ``[lo, hi]`` it runs two barriers — on ``d_lo = q_j - lo`` and
+    ``d_hi = hi - q_j`` — each repelling when the joint approaches that bound. The task maps are
+    the identity per joint, so this is a config-space (pre-pullback) spec: a diagonal metric and
+    a per-joint acceleration, built fully vectorized over joints (no Python loop, no scalar pack).
+
+    ``margin`` shifts the effective limit inward (stay-out band); ``eps`` floors the distance so
+    the barrier stays large-but-finite at the boundary instead of producing NaNs.
+    """
+    m = provider.mj_model
+    nq = provider.nq
+    limited = jnp.asarray(m.jnt_limited.astype(bool))            # (nq,) which joints have a range
+    lo = jnp.asarray(m.jnt_range[:, 0])
+    hi = jnp.asarray(m.jnt_range[:, 1])
+    # jnt order == qpos order for an all-hinge serial arm (1 dof/joint); assert to be safe.
+    if not (np.array_equal(m.jnt_qposadr, np.arange(nq)) and m.nv == nq):
+        raise ValueError("joint_limit_geometry assumes 1-dof joints with qpos order == joint order")
+
+    def leaf(q, qd, params):
+        dtype = q.dtype
+        mask = limited.astype(dtype)
+        d_lo = jnp.clip(q - lo - margin, eps, None)              # distance to lower bound (+ => q up)
+        d_hi = jnp.clip(hi - q - margin, eps, None)              # distance to upper bound (+ => q down)
+        dd_lo = qd                                               # d/dt d_lo
+        dd_hi = -qd                                              # d/dt d_hi
+        a_lo = _barrier_accel(d_lo, dd_lo, k_b, power)           # pushes q up  (+)
+        a_hi = _barrier_accel(d_hi, dd_hi, k_b, power)           # pushes q down (-)
+        a_geo = (a_lo - a_hi) * mask                             # (nq,) config-space accel
+        diag = (_barrier_metric(d_lo, dd_lo, m_b)
+                + _barrier_metric(d_hi, dd_hi, m_b)) * mask      # (nq,) metric weight
+        M = jnp.diag(diag)
+        f = -diag * a_geo                                        # f = -M a_des (M diagonal)
+        return Spec(M, f)
+
+    return leaf
+
+
+def obstacle_geometry(provider, center, radius: float, k_b: float = 1.0, power: float = 2.0,
+                      m_b: float = 2.0, margin: float = 0.0, eps: float = 1e-3,
+                      site_name: Optional[str] = None):
+    """Barrier geometry that keeps the tracked site outside a sphere obstacle.
+
+    Task map is the signed distance ``d(q) = ||p_site(q) - center|| - radius`` (see
+    :func:`fabrix.maps.sphere_sdf_map`); the 1-D barrier repels when the site approaches the
+    surface, then is pulled back to config space through the SDF Jacobian (with its curvature
+    term). ``center`` is baked at construction (static); lifting it to a traced param gives a
+    reactive moving-obstacle fabric with no structural change.
+    """
+    phi = sphere_sdf_map(provider, center, radius, site_name=site_name)
+
+    def leaf(q, qd, params):
+        x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(1,) J:(1,nq) Jdq:(1,)
+        d = jnp.clip(x[0] - margin, eps, None)
+        dd = (J @ qd)[0]
+        a_g = _barrier_accel(d, dd, k_b, power)                 # scalar, away from surface (+d)
+        m = _barrier_metric(d, dd, m_b)                         # scalar
+        M = m.reshape(1, 1)
+        f = (-m * a_g).reshape(1)                               # f = -M a_des
+        return pullback(Spec(M, f), J, Jdq)
+
+    return leaf
+
+
+# ---------------------------------------------------------------------------
+# Barrier *potentials* (forcing leaves). These — not the energized geometries — are what make a
+# constraint a hard invariant: the potential diverges at the boundary, so finite kinetic energy
+# can never reach it. Pair each with its energized geometry for reactive, smooth avoidance.
+# ---------------------------------------------------------------------------
+def joint_limit_potential(provider, k_p: float = 0.05, d0: float = 0.3, m_p: float = 2.0,
+                          margin: float = 0.0, eps: float = 1e-3):
+    """Repulsive barrier potential keeping each *limited* joint inside its range (forcing leaf).
+
+    A diverging potential on each joint's distance to its bounds; the identity task map per joint
+    makes it a direct config-space spec, vectorized over joints. ``d0`` is the standoff band.
+    """
+    m = provider.mj_model
+    nq = provider.nq
+    limited = jnp.asarray(m.jnt_limited.astype(bool))
+    lo = jnp.asarray(m.jnt_range[:, 0])
+    hi = jnp.asarray(m.jnt_range[:, 1])
+    if not (np.array_equal(m.jnt_qposadr, np.arange(nq)) and m.nv == nq):
+        raise ValueError("joint_limit_potential assumes 1-dof joints with qpos order == joint order")
+
+    def leaf(q, qd, params):
+        dtype = q.dtype
+        mask = limited.astype(dtype)
+        d_lo = jnp.clip(q - lo - margin, eps, None)             # distance to lower bound
+        d_hi = jnp.clip(hi - q - margin, eps, None)             # distance to upper bound
+        f_lo = _barrier_potential_grad(d_lo, k_p, d0)           # dpsi/dd_lo  (d d_lo / dq = +1)
+        f_hi = _barrier_potential_grad(d_hi, k_p, d0)           # dpsi/dd_hi  (d d_hi / dq = -1)
+        f = (f_lo - f_hi) * mask
+        band = _band(d_lo, d0) + _band(d_hi, d0)
+        return Spec(jnp.diag(m_p * band * mask), f)
+
+    return leaf
+
+
+def obstacle_potential(provider, center, radius: float, k_p: float = 0.5, d0: float = 0.2,
+                       m_p: float = 4.0, margin: float = 0.0, eps: float = 1e-3,
+                       site_name: Optional[str] = None):
+    """Repulsive barrier potential keeping the tracked site outside a sphere (forcing leaf).
+
+    The position-only counterpart to :func:`obstacle_geometry`: its force diverges at the surface,
+    so it can halt even a head-on approach — this is the leaf that makes non-penetration a hard
+    invariant. Localized to the standoff band ``d0``.
+    """
+    phi = sphere_sdf_map(provider, center, radius, site_name=site_name)
+
+    def leaf(q, qd, params):
+        x, J, Jdq = value_jac_curv(phi, q, qd)
+        d = jnp.clip(x[0] - margin, eps, None)
+        f = _barrier_potential_grad(d, k_p, d0).reshape(1)      # task-space potential force
+        m = (m_p * _band(d, d0)).reshape(1, 1)                  # smooth standoff envelope
+        return pullback(Spec(m, f), J, Jdq)
+
+    return leaf

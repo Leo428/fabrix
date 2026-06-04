@@ -69,23 +69,32 @@ to a target; integrate to a smooth joint reference.
 - **Known transient:** `q̈` has a one-time step at `t=0` (step response from rest), not per-step
   chatter. A soft-start or M2 speed-control rounds it off.
 
-### ☐ M2 — energization + obstacle/joint-limit geometries (NEXT)
-Turns the forced base case into a *full* geometric fabric. TODO:
-- [ ] `fabrix/energy.py`: Finsler energies (HD2 in `q̇`); energy metric `M_e = ∂²_{q̇} L_e` via
-  `jax.hessian`; the Euler–Lagrange force terms. Start with a Lagrangian energy `½ q̇ᵀ G(x) q̇`.
-- [ ] `fabrix/geometry.py`: the **energization operator** — given an HD2 geometry `q̈ = -h₂(x,ẋ)`
-  and a Finsler energy, produce the energized acceleration that follows the geometry's path while
-  conserving the energy (the energy-orthogonal "boost" along `ẋ`). Pin the exact formula to
-  *Optimization Fabrics* (Ratliff et al.) / *Geometric Fabrics* (Van Wyk et al.).
-  - [ ] **Gate with an energy-conservation test**: geometry alone conserves `L_e` to ~1e-6 over
-    a rollout. This is the correctness check for the operator.
-- [ ] HD2 geometry leaves:
-  - [ ] joint-limit avoidance: barrier on `(q - q_min)`, `(q_max - q)`; HD2 geometry that pushes
-    away as a limit nears; **invariant test: limits never violated**.
-  - [ ] obstacle avoidance: task map = signed distance (start with analytic SDFs for sphere/plane
-    primitives — MJX collision is thin); repulsive HD2 geometry; **invariant test: no penetration**.
-- [ ] Assemble: energized geometries + M1 attractor (forcing potential) + damping → goal reached
-  *and* constraints respected, still smooth. Tests: goal still reached; smoothness preserved.
+### ✅ M2 — energization + obstacle/joint-limit geometries (DONE)
+Turns the forced base case into a *full* geometric fabric.
+- **`fabrix/energy.py`** — `energy_spec(L_e, x, xd)` builds the energy spec `(M_e, f_e)` from a
+  Lagrangian by autodiff (`M_e = ∂²_{ẋ}L_e`, `f_e = ∂_x(∂_{ẋ}L_e)·ẋ − ∂_x L_e`); `fixed_metric_energy`
+  (`L_e = ½‖ẋ‖²`) and `lagrangian_energy(G_fn)`. Validated: `M_e == G(x)` exact; the rate identity
+  `dH_e/dt = ẋᵀ(M_e ẍ + f_e)` to **4e-16**.
+- **`fabrix/geometry.py`** — `energize(a_g, v, M_e, f_e)` = `a_g − [vᵀ(M_e a_g + f_e)/(vᵀM_e v)] v`:
+  zeroes the energy rate (instantaneously **~1e-9**) with the correction **purely along v** (path
+  preserved, off-axis part ~1e-17). HD2 barrier geometries `joint_limit_geometry`,
+  `obstacle_geometry` (SDF map) + barrier **potentials** `joint_limit_potential`, `obstacle_potential`.
+- **Assembly** `GeometricFabric` (`fabrix/fabric.py`): geometries → combine → resolve = root
+  geometry accel; energize; + forcing (attractor) + damping → resolve.
+- **Three things learned (load-bearing):**
+  1. **Energize at the *root*.** A barrier's 1-D leaf space makes energization degenerate (any 1-D
+     accel changes speed → the projection kills it); combine geometries to config space first.
+  2. **The invariant comes from the *potential*, not the geometry.** An energized geometry conserves
+     speed, so it deflects but cannot *stop* a head-on approach; a barrier potential (diverging at the
+     boundary) is what makes non-penetration / limit-respect a hard invariant.
+  3. **`geom_reg` must clear float32 eps.** The root-geometry solve regularizer at `1e-6` ≈ float32
+     eps amplified noise into q̈ chatter (max Δq̈ 0.36 → 10+); `geom_reg=1e-4` fixes it, behavior
+     unchanged. Strict HD2 sign-switch kept; potential metrics use a C1 standoff band (`_band`).
+- **Results:** geometry-only energy drift **7.5e-4**; joint-limit & obstacle invariants **never
+  violated**; reach-with-obstacle **10 mm** + **no penetration** (77 mm standoff) + C2 (max Δq̈ **0.31**,
+  float32); full policy **~66 µs/step**. `uv run pytest -q` → **19 passing** (8 M1 + 11 M2).
+- **Files:** `fabrix/{energy,geometry}.py`, `GeometricFabric`, SDF maps; `demos/obstacle_reach.py`
+  (→ `obstacle_reach.png`); `tests/test_m2.py`.
 
 ### ☐ M3 — orientation / full SE(3) pose (PROJECT ENDPOINT)
 - [ ] Extend `CustomFK` with `site_pose(q) -> (pos, quat)` (orientation is already available as
@@ -104,13 +113,14 @@ pure-functional + vmap-clean anyway — free hygiene.)
 ## Run
 
 ```bash
-uv run pytest -q                          # 9 tests
-uv run python demos/attractor_reach.py    # -> demos/attractor_reach.png
+uv run pytest -q                          # 19 tests
+uv run python demos/attractor_reach.py    # M1 -> demos/attractor_reach.png
+uv run python demos/obstacle_reach.py     # M2 -> demos/obstacle_reach.png
 ```
 
 ## Environment / facts
 
-- uv project (Python 3.12): jax, mujoco, mujoco-mjx, jaxlie, matplotlib; pytest (dev).
+- uv project (Python 3.12): jax, jax-dataclasses, jaxlie, matplotlib, mujoco; pytest (dev).
   `pyproject.toml` has `[tool.pytest.ini_options] pythonpath=["."]`.
 - Models: MuJoCo Menagerie sparse-checkout (`kinova_gen3`, `robotiq_2f85`) — not vendored.
 - Gen3 EE site is `pinch_site`; arm is 7 hinge joints (`nq=nv=7`).

@@ -9,8 +9,9 @@ vibrate. `fabrix` is built on autodiff: the task Jacobian and the curvature term
 straight from `jax.jacfwd` / nested `jvp`, so the whole policy is `jit`-fast and correct by
 construction.
 
-**Status: Milestone 1 complete** — a forced attractor fabric on a Kinova Gen3.
-Full plan, progress, and TODOs in [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status: Milestones 1–2 complete** — a forced attractor fabric, then energized obstacle &
+joint-limit geometries, on a Kinova Gen3. Full plan, progress, and TODOs in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Setup
 
@@ -26,15 +27,19 @@ cd mujoco_menagerie && git sparse-checkout set kinova_gen3 robotiq_2f85 && cd ..
 ## Run
 
 ```bash
-uv run pytest -q                          # correctness, convergence, smoothness, latency
-uv run python demos/attractor_reach.py    # reach demo -> demos/attractor_reach.png
+uv run pytest -q                          # correctness, convergence, smoothness, latency, invariants
+uv run python demos/attractor_reach.py    # M1 reach demo    -> demos/attractor_reach.png
+uv run python demos/obstacle_reach.py     # M2 reach + avoid -> demos/obstacle_reach.png
 ```
 
-## Results (M1)
+## Results
 
-- End-effector reach error **1.17 mm**; controller **~53 µs/step** (float32, CPU) — ~5% of a
-  1 kHz budget, so single-arm real-time is comfortable.
-- Commanded `q̇`/`q̈` are continuous and bounded (a C2 reference).
+**M1 (attractor):** end-effector reach error **1.17 mm**; controller **~53 µs/step** (float32, CPU)
+— ~5% of a 1 kHz budget; commanded `q̇`/`q̈` continuous and bounded (a C2 reference).
+
+**M2 (energized obstacle/limit fabric):** reaches the goal **and** routes around a sphere with **no
+penetration**, joint limits **never violated**, energy conserved by energization; still C2 (max
+step-to-step `q̈` ≈ 0.31) at **~66 µs/step**.
 
 ## Layout
 
