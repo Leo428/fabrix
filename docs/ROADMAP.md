@@ -103,6 +103,24 @@ Turns the forced base case into a *full* geometric fabric.
   **jaxlie** (`SE3.from_rotation_and_translation`, `.inverse()`, `@`, `.log()`).
 - [ ] 6-DOF pose attractor leaf; `J`/`J̇q̇` through the jaxlie expression by autodiff (verify the
   nested `jvp` flows through jaxlie). Tests: position+orientation convergence, smoothness.
+- [ ] Demo: upgrade `interactive_track.py` to also track the mocap target's **orientation** (read
+  `mocap_quat`, 6-DOF target) — supplies the rotation tracking the interactive demo currently lacks.
+
+### Backlog / follow-ups (noted from the interactive demo, 2026-06)
+Driving `demos/interactive_track.py` surfaced these. None block M3; revisit after (or fold the
+rotation one into M3):
+- **Rotation tracking** — mocap can be rotated (Ctrl+left-drag) but the arm ignores it
+  (position-only). Lands with **M3** (above).
+- **Obstacle avoided from too far (~10–20 cm)** — the `obstacle_potential` standoff band is
+  `d0=0.2` (20 cm). Lower it (~0.08–0.12) for tighter avoidance. Tunable, not a bug.
+- **No ground/floor avoidance** — `plane_sdf_map` exists but no plane barrier leaf is wired in.
+  Generalize the obstacle leaves to take any task map (or add a plane variant) + add a ground
+  obstacle to the demo.
+- **Self-collision is NOT handled** — the arm avoids self-collision only *incidentally* (posture +
+  the motions tried); there are no self-collision leaves. Real support = pairwise body-distance task
+  maps (capsule/sphere proxies), a separate feature.
+- **Draggable obstacle** — lift the obstacle center to a traced `FabricParams` field (~10 lines) so
+  the obstacle can be dragged live too.
 
 ### Out of scope
 M4-style batched-RL benchmarks / learnable fabrics; hardware StableHLO/AOT export. (Keep code
