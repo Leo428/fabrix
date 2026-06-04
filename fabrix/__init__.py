@@ -3,6 +3,11 @@
 Milestone 1: forced attractor fabric. Public surface grows as milestones land.
 """
 
+from fabrix.collision import (
+    SphereModel, arm_obstacle_geometry, arm_obstacle_potential, arm_plane_geometry,
+    arm_plane_potential, auto_arm_spheres, nonadjacent_pairs, self_collision_geometry,
+    self_collision_potential,
+)
 from fabrix.diff import value_jac_curv
 from fabrix.energy import energy_spec, fixed_metric_energy, lagrangian_energy
 from fabrix.fabric import Fabric, FabricParams, GeometricFabric
@@ -29,6 +34,10 @@ __all__ = [
     "energize", "joint_limit_geometry", "joint_limit_potential",
     "obstacle_geometry", "obstacle_potential", "plane_geometry", "plane_potential",
     "sdf_barrier_geometry", "sdf_barrier_potential",
+    "SphereModel", "auto_arm_spheres", "nonadjacent_pairs",
+    "self_collision_geometry", "self_collision_potential",
+    "arm_obstacle_geometry", "arm_obstacle_potential",
+    "arm_plane_geometry", "arm_plane_potential",
     "Fabric", "FabricParams", "GeometricFabric",
     "step", "rollout",
 ]

@@ -1,6 +1,7 @@
 # fabrix — Roadmap, Status & TODOs
 
-Living design+status doc. Project scope is **M1 → M3** — **all complete** (2026-06). (M4-style
+Living design+status doc. Project scope is **M1 → M3** — **all complete** (2026-06), plus a post-M3
+**whole-arm + self-collision** capability (collision spheres, see below — also complete). (M4-style
 batched-RL / learnable fabrics and hardware StableHLO/AOT export are explicitly out of scope.)
 
 ---
@@ -155,13 +156,49 @@ Driving `demos/interactive_track.py` surfaced these. With M1→M3 complete these
     per-joint ranges (override the model's `jnt_range`) → a *guaranteed* no-go region. Small addition.
   - **#3 Keep-out volume** (user's lap/torso) — a task-space plane/box barrier; to protect the elbow
     and links (not just the EE) it needs the whole-arm collision spheres below.
-- **Self-collision / whole-arm obstacle avoidance** — *open*. The arm avoids self-collision only
-  *incidentally*; there are no self-collision leaves. Real support = **collision-sphere** proxies (a
-  few spheres rigidly attached per link), then a `sdf_barrier_*` leaf on each non-adjacent
-  sphere-pair distance (and each sphere vs each environment obstacle / keep-out volume — this is also
-  what #3 needs). Needs FK to arbitrary link frames (our `bodies(q)` loop already computes them —
-  expose per-body world transforms + sphere offsets) and `vmap` over pairs. NVIDIA fabrics / cuRobo
-  machinery. The barrier core (`sdf_barrier_*`) is already done and reusable.
+- **Self-collision / whole-arm obstacle avoidance** — ✅ **DONE (2026-06)**. Collision-sphere proxies
+  (`fabrix/collision.py`): `auto_arm_spheres` places spheres along each link's bone (radius from the
+  collision-mesh width; hand-tunable via `SphereModel` / `SphereModel.from_dict`), `nonadjacent_pairs`
+  selects the self-collision pairs (excludes same-link + parent-child). A **batched / shared-FK**
+  barrier — one FK to all link frames (`CustomFK.body_poses`, **#8**), vectorized pairwise/region SDFs,
+  one summed pullback (generalized `sdf_barrier_*`, **#1**) — drives `self_collision_{geometry,potential}`
+  and the whole-arm `arm_obstacle_*` / `arm_plane_*` (obstacle & floor now guard *every* sphere, not
+  just the EE). Geometry deflects, potential is the hard wall (the M2 division of labour).
+  - **Validated** (`tests/test_collision.py`, 7): `body_poses` vs MuJoCo 1e-9; self-collision `J`/`J̇q̇`
+    vs finite-diff 1e-10; the batched leaf is **bit-identical** to ``k`` separate leaves (`max|Δ|<1e-9`,
+    the #1 claim); driven into a −73 mm self-colliding fold it stays clear, and a forearm rammed −106 mm
+    through an obstacle deflects to **+55 mm** while the EE still reaches (2 mm). Full collision fabric
+    (k=84 self + 16 obstacle + 16 floor) **~124 µs/step** — only ~15 µs over the base fabric (the batched
+    payoff). `--check`: obstacle +53 mm, floor +143 mm, self-collision +29 mm, all CLEAR; the demo draws
+    the spheres translucent-blue.
+  - **#1 batched `sdf_barrier`** + **#8 per-link FK** — ✅ done (the two foundations above).
+  - Still deferred to real-arm dimensions: **#2** hard joint no-go limits, **#3** keep-out volume
+    (the whole-arm sphere machinery #3 needs is now in place — add a keep-out plane/box barrier over the spheres).
+
+### Performance profile (2026-06-04, CPU float32, single arm)
+Profiled the real 10-leaf demo fabric (throwaway harness `/tmp/profile_fabrix.py`; promote to
+`bench/` if a permanent guard is wanted).
+- **~110–123 µs / control step** (single dispatch, distinct inputs) — ~8× under the 1 kHz budget.
+  Hygiene clean: params traced (6 values → 1 compile, no recompiles), q̈ + pose-error stay float32,
+  output finite. No anti-patterns.
+- **Cost = per-leaf autodiff of the FK.** FK primal ~7 µs; +J+curvature 4–6× that; a full FK-leaf
+  60–90 µs. Config-space leaves (posture/limit/damping) + `resolve` are **~free** (<1 µs). XLA
+  dedupes the cheap primal across leaves but **not** the autodiff → the redundancy that #1 fixes.
+- **`lax.scan` of the policy is ~2× per-eval vs independent dispatches** (loses thread-parallelism).
+  A hard 1 kHz loop should dispatch once/step; the demo's 8-substep scan (~2.5 ms) is fine (16 ms budget).
+- **Scaling (the collision decision):** N obstacle barriers, separate leaves vs one batched leaf —
+  N=64: separate **41 s compile / 235 µs**, batched **2.7 s compile (flat) / 131 µs**, `max|Δq̈|=0`.
+
+### Code-quality backlog (#2–#7, from the 2026-06 profile — deferred, low value)
+Minor / cosmetic; XLA already absorbs most. Park here, revisit opportunistically (e.g. when editing
+the file anyway). #1 (batched barriers) and #8 (per-link FK) are **done** — see the self-collision
+entry above.
+- **#2** `value_jac_curv` evals the primal `x = phi(q)` that `jacfwd(phi)(q)` also recomputes (redundant primal).
+- **#3** `J @ qd` computed twice in barrier leaves (explicit `dd`, and again as the primal of the curvature jvp).
+- **#4** `d ** power` with `power=2.0` (float pow) instead of `d*d` in `_barrier_accel`.
+- **#5** `obstacle_*(center=None)` rebuilds the `sphere_sdf_map` closure inside the leaf each trace (harmless, hoistable).
+- **#6** `resolve` has no graceful fallback if the metric is non-PD (relies on posture+damping invariant; reg=1e-6). Document louder.
+- **#7** `combine` Python-loop sum — fine for static small N; the batched design sidesteps it for collision.
 
 ### Out of scope
 M4-style batched-RL benchmarks / learnable fabrics; hardware StableHLO/AOT export. (Keep code
@@ -172,10 +209,10 @@ pure-functional + vmap-clean anyway — free hygiene.)
 ## Run
 
 ```bash
-uv run pytest -q                          # 25 tests (8 M1 + 11 M2 + 6 M3)
+uv run pytest -q                          # 35 tests (11 M1 + 11 M2 + 6 M3 + 7 collision)
 uv run python demos/attractor_reach.py    # M1 -> demos/attractor_reach.png
 uv run python demos/obstacle_reach.py     # M2 -> demos/obstacle_reach.png
-uv run mjpython demos/interactive_track.py        # M3 drag-to-track 6-DOF pose (macOS; --check headless)
+uv run mjpython demos/interactive_track.py        # M3 6-DOF pose + whole-arm/self-collision (macOS; --check headless)
 ```
 
 ## Environment / facts

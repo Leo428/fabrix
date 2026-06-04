@@ -10,8 +10,9 @@ straight from `jax.jacfwd` / nested `jvp`, so the whole policy is `jit`-fast and
 construction.
 
 **Status: Milestones 1–3 complete** (the full project scope) — a forced attractor fabric, then
-energized obstacle & joint-limit geometries, then full **SE(3) pose** tracking, on a Kinova Gen3.
-Full plan, progress, and TODOs in [docs/ROADMAP.md](docs/ROADMAP.md).
+energized obstacle & joint-limit geometries, then full **SE(3) pose** tracking, on a Kinova Gen3 —
+plus a post-M3 **whole-arm & self-collision** layer (collision spheres). Full plan, progress, and
+TODOs in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Setup
 
@@ -47,11 +48,17 @@ C2-smooth, at **~88 µs/step** (float32). The error `Log(T*⁻¹T) ∈ se(3)` an
 straight from autodiff through `jaxlie`. `demos/interactive_track.py` is a live viewer: drag and
 rotate a 6-DOF target and watch the arm track it while avoiding an obstacle.
 
+**Whole-arm & self-collision (collision spheres):** spheres auto-placed on every link give the *whole*
+arm — not just the EE — obstacle/floor avoidance, plus a self-collision barrier between non-adjacent
+links. All pairs run as one **batched, shared-FK** barrier (one FK to every link frame, vectorized
+pairwise SDFs, one summed pullback), so the full fabric (84 self-pairs + 32 environment) is **~124
+µs/step** — ~15 µs over the base. Bit-identical to per-pair leaves but flat in compile time.
+
 ## Layout
 
 | path | contents |
 |---|---|
-| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`, `site_pose`), `maps` (position / SDF / SE(3) pose), `leaves` (attractor, `pose_attractor`, posture, damping), `energy` (Finsler), `geometry` (energization + barriers), `fabric`, `integrate` |
+| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`, `site_pose`, `body_poses`), `maps` (position / SDF / SE(3) pose), `leaves` (attractor, `pose_attractor`, posture, damping), `energy` (Finsler), `geometry` (energization + barriers), `collision` (sphere model + whole-arm/self-collision), `fabric`, `integrate` |
 | `demos/` | runnable demos |
 | `tests/` | pytest suite |
 | `experiments/` | de-risking scratch (autodiff-FK correctness + latency studies) |

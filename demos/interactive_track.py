@@ -3,7 +3,9 @@
 A live MuJoCo viewer. Double-click the GREEN target, then Ctrl + right-drag to move it and
 Ctrl + left-drag to rotate it; the geometric fabric drives the end-effector to follow that full
 6-DOF pose (M3) — smoothly routing around the RED obstacle (also draggable), staying above the
-FLOOR, and respecting joint limits. The arm shows the *commanded* configuration (the fabric
+FLOOR, and respecting joint limits. Avoidance is **whole-arm**: the translucent blue collision
+spheres (auto-placed on every link) all dodge the obstacle and floor, and a self-collision barrier
+keeps the arm from folding into itself. The arm shows the *commanded* configuration (the fabric
 integrated to a joint reference), i.e. the C2-smooth stream a real servo would track quietly.
 
 macOS needs mjpython (the interactive viewer must own the main thread):
@@ -11,8 +13,8 @@ macOS needs mjpython (the interactive viewer must own the main thread):
     uv run mjpython demos/interactive_track.py        # macOS
     uv run python   demos/interactive_track.py        # Linux / Windows
 
-Headless self-check (no GUI; sweeps the target across the obstacle and down toward the floor and
-reports clearances):
+Headless self-check (no GUI; sweeps the target across the obstacle, down toward the floor, and folds
+the arm inward, reporting whole-arm + self-collision clearances):
 
     uv run python demos/interactive_track.py --check
 """
@@ -30,10 +32,12 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
-from fabrix import (CustomFK, FabricParams, GeometricFabric, config_damping,
-                    fixed_metric_energy, joint_limit_geometry, joint_limit_potential,
-                    obstacle_geometry, obstacle_potential, plane_geometry, plane_potential,
-                    pose_attractor, posture)
+from fabrix import (CustomFK, FabricParams, GeometricFabric, arm_obstacle_geometry,
+                    arm_obstacle_potential, arm_plane_geometry, arm_plane_potential,
+                    auto_arm_spheres, config_damping, fixed_metric_energy, joint_limit_geometry,
+                    joint_limit_potential, nonadjacent_pairs, pose_attractor, posture,
+                    self_collision_geometry, self_collision_potential)
+from fabrix.collision import _centers
 
 GEN3 = "mujoco_menagerie/kinova_gen3/gen3.xml"
 SCENE = "mujoco_menagerie/kinova_gen3/scene.xml"
@@ -57,6 +61,11 @@ POSTURE_W = 1.0    # posture priority toward q_default (the upright nominal); a 
 OBST_GEOM_D0 = 0.12   # start bending the path within 12 cm of the obstacle surface
 OBST_POT_D0 = 0.02    # hard-wall standoff: the non-penetration potential acts within 2 cm
 FLOOR_D0 = 0.12       # floor: cushion within 12 cm of the ground (geometry + potential)
+# Collision spheres: the obstacle/floor barriers now guard the WHOLE arm (every sphere), not just the
+# EE, and a self-collision barrier keeps non-adjacent links apart. Spheres are auto-placed from the
+# kinematics and drawn translucent blue in the viewer (for tuning); the count is nearly free (batched).
+SELF_GEOM_D0 = 0.06   # self-collision: start deflecting two links apart within 6 cm of contact
+SELF_POT_D0 = 0.03    # hard self-collision wall: the no-penetration potential acts within 3 cm
 
 
 def build_model():
@@ -74,21 +83,27 @@ def build_model():
 
 
 def _controller():
-    """Build the provider, fabric, and a jitted SUB-step integrator.
+    """Build the provider, sphere model, fabric, and a jitted SUB-step integrator.
 
-    The sphere obstacle is param-driven (``center=None`` -> ``params.obstacle_center``) so it can be
-    dragged live; the floor is a static plane barrier on the scene's ground plane.
+    Whole-arm avoidance: the obstacle and floor barriers act on *every* collision sphere (auto-placed
+    along the links), and a self-collision barrier keeps non-adjacent links apart — all as single
+    batched leaves. The sphere obstacle is param-driven (``center=None`` -> ``params.obstacle_center``)
+    so it can be dragged live; the floor is a static plane barrier on the scene's ground plane.
     """
     prov = CustomFK(GEN3)
     nq = prov.nq
+    sph = auto_arm_spheres(prov, n_per_link=2)        # auto collision spheres; hand-tune via SphereModel
+    pairs = nonadjacent_pairs(sph, prov)              # non-adjacent link pairs for self-collision
     floor_pt, floor_n = (0.0, 0.0, FLOOR_Z), (0.0, 0.0, 1.0)
     fab = GeometricFabric(
-        geometries=[obstacle_geometry(prov, None, OBSTACLE_RADIUS, d0=OBST_GEOM_D0),
+        geometries=[arm_obstacle_geometry(prov, sph, None, OBSTACLE_RADIUS, d0=OBST_GEOM_D0),
+                    self_collision_geometry(prov, sph, pairs, d0=SELF_GEOM_D0),
                     joint_limit_geometry(prov),
-                    plane_geometry(prov, floor_pt, floor_n, d0=FLOOR_D0)],
+                    arm_plane_geometry(prov, sph, floor_pt, floor_n, d0=FLOOR_D0)],
         forcing=[pose_attractor(prov, k=POSE_K, b=POSE_B, f_max=POSE_FMAX), posture(nq, weight=POSTURE_W),
-                 obstacle_potential(prov, None, OBSTACLE_RADIUS, d0=OBST_POT_D0),
-                 plane_potential(prov, floor_pt, floor_n, d0=FLOOR_D0),
+                 arm_obstacle_potential(prov, sph, None, OBSTACLE_RADIUS, d0=OBST_POT_D0),
+                 self_collision_potential(prov, sph, pairs, d0=SELF_POT_D0),
+                 arm_plane_potential(prov, sph, floor_pt, floor_n, d0=FLOOR_D0),
                  joint_limit_potential(prov)],
         damping=[config_damping(nq, b=CFG_DAMP)],
         energy=fixed_metric_energy(nq, jnp.float32))
@@ -104,15 +119,18 @@ def _controller():
         (q, qd), _ = jax.lax.scan(body, (q, qd), None, length=SUB)
         return q, qd
 
-    return prov, advance
+    return prov, advance, sph
 
 
 def main():
     import mujoco.viewer
 
     model, tgt_id, obs_id = build_model()
-    prov, advance = _controller()
+    prov, advance, sph = _controller()
     nq = prov.nq
+    centers_fn = jax.jit(_centers(prov, jnp.asarray(sph.link), jnp.asarray(sph.local)))
+    sph_rgba = np.array([0.2, 0.6, 1.0, 0.35], np.float32)   # translucent blue collision spheres
+    eye = np.eye(3).flatten()
 
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)               # "home"
@@ -125,7 +143,8 @@ def main():
 
     print(__doc__)
     print(">>> double-click the GREEN target or RED obstacle, then Ctrl + right-drag (move) "
-          "/ Ctrl + left-drag (rotate the target) <<<\n")
+          "/ Ctrl + left-drag (rotate the target) <<<")
+    print(">>> translucent blue = the arm's collision spheres (whole-arm + self-collision avoidance) <<<\n")
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
             tic = time.perf_counter()
@@ -136,6 +155,12 @@ def main():
             q, qd = advance(q, qd, params)
             data.qpos[:nq] = np.asarray(q)
             mujoco.mj_forward(model, data)
+            c = np.asarray(centers_fn(q))                     # draw the collision spheres as decorations
+            viewer.user_scn.ngeom = 0
+            for i in range(len(c)):
+                mujoco.mjv_initGeom(viewer.user_scn.geoms[i], mujoco.mjtGeom.mjGEOM_SPHERE,
+                                    np.array([sph.radius[i], 0.0, 0.0]), c[i].astype(np.float64), eye, sph_rgba)
+                viewer.user_scn.ngeom += 1
             viewer.sync()
             lag = SUB * DT - (time.perf_counter() - tic)
             if lag > 0:
@@ -146,7 +171,7 @@ def check():
     """Headless: sweep the target across the obstacle, then down toward the floor; report clearances
     and the distance at which the arm *begins* to detour around the obstacle."""
     model, _, _ = build_model()
-    prov, advance = _controller()
+    prov, advance, sph = _controller()
     nq = prov.nq
     center = np.asarray(OBSTACLE_CENTER)
     q_home = jnp.asarray(model.key_qpos[0, :nq], jnp.float32)
@@ -172,9 +197,10 @@ def check():
         min_clear = min(min_clear, clear)
         if perp > 0.01:                      # detouring; track the largest clearance where it does
             onset = max(onset, clear)
-    print(f"[obstacle] swept through center: min clearance {min_clear*1e3:+.1f} mm "
-          f"({'CLEAR' if min_clear >= 0 else 'PENETRATED'}); arm begins to detour at "
-          f"~{onset*1e3:.0f} mm clearance (was ~150-200 mm before tuning d0)")
+    print(f"[obstacle] swept through center: min EE clearance {min_clear*1e3:+.1f} mm "
+          f"({'CLEAR' if min_clear >= 0 else 'PENETRATED'}); EE begins to deviate at "
+          f"~{onset*1e3:.0f} mm clearance (whole-arm: a forearm/elbow sphere reaches the obstacle "
+          f"before the EE does, so the EE deflects earlier than the EE-only band)")
 
     # (2) target descends toward the floor, away from the obstacle: tests the plane barrier
     q, qd = q_home, jnp.zeros(nq, jnp.float32)
@@ -187,6 +213,22 @@ def check():
         min_z = min(min_z, float(prov.site_pos(q)[2]))
     print(f"[floor] target driven below ground: min EE height {min_z*1e3:+.1f} mm "
           f"({'ABOVE floor' if min_z >= FLOOR_Z else 'BELOW floor'})")
+
+    # (3) self-collision: command the EE down-and-in so the arm folds back over itself; the
+    #     self-collision barrier must hold the non-adjacent links apart (min sphere-pair gap >= 0)
+    pairs = nonadjacent_pairs(sph, prov)
+    cf = _centers(prov, jnp.asarray(sph.link), jnp.asarray(sph.local))
+    rsum = sph.radius[pairs[:, 0]] + sph.radius[pairs[:, 1]]
+    q, qd = q_home, jnp.zeros(nq, jnp.float32)
+    min_gap = np.inf
+    for tgt in ([0.0, 0.15, 0.2], [0.0, 0.0, 0.15], [-0.1, 0.0, 0.2], [0.0, -0.15, 0.15]):
+        for _ in range(500):
+            q, qd = advance(q, qd, params(jnp.asarray(tgt, jnp.float32)))
+            c = np.asarray(cf(q))
+            gaps = np.linalg.norm(c[pairs[:, 0]] - c[pairs[:, 1]], axis=1) - rsum
+            min_gap = min(min_gap, float(gaps.min()))
+    print(f"[self-collision] folding the arm inward: min non-adjacent sphere-pair gap "
+          f"{min_gap*1e3:+.1f} mm ({'CLEAR' if min_gap >= 0 else 'CONTACT'})")
     assert bool(jnp.all(jnp.isfinite(q)))
 
 
