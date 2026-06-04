@@ -26,6 +26,10 @@ class FabricParams:
     # position-only fabrics (M1/M2) need not supply it.
     target_quat: jnp.ndarray = dataclasses.field(
         default_factory=lambda: jnp.array([1.0, 0.0, 0.0, 0.0]))
+    # (3,) center of a draggable sphere obstacle (read by obstacle leaves built with center=None);
+    # far-away default so an unset/unused obstacle leaf stays inert.
+    obstacle_center: jnp.ndarray = dataclasses.field(
+        default_factory=lambda: jnp.array([0.0, 0.0, 100.0]))
 
 
 class Fabric:

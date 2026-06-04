@@ -8,7 +8,8 @@ from fabrix.energy import energy_spec, fixed_metric_energy, lagrangian_energy
 from fabrix.fabric import Fabric, FabricParams, GeometricFabric
 from fabrix.geometry import (
     energize, joint_limit_geometry, joint_limit_potential, obstacle_geometry,
-    obstacle_potential,
+    obstacle_potential, plane_geometry, plane_potential, sdf_barrier_geometry,
+    sdf_barrier_potential,
 )
 from fabrix.integrate import rollout, step
 from fabrix.kinematics import CustomFK, KinematicsProvider
@@ -26,7 +27,8 @@ __all__ = [
     "attractor", "pose_attractor", "posture", "config_damping",
     "energy_spec", "fixed_metric_energy", "lagrangian_energy",
     "energize", "joint_limit_geometry", "joint_limit_potential",
-    "obstacle_geometry", "obstacle_potential",
+    "obstacle_geometry", "obstacle_potential", "plane_geometry", "plane_potential",
+    "sdf_barrier_geometry", "sdf_barrier_potential",
     "Fabric", "FabricParams", "GeometricFabric",
     "step", "rollout",
 ]

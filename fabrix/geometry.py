@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from fabrix.diff import value_jac_curv
-from fabrix.maps import sphere_sdf_map
+from fabrix.maps import plane_sdf_map, sphere_sdf_map
 from fabrix.spec import Spec, pullback
 
 
@@ -131,30 +131,71 @@ def joint_limit_geometry(provider, k_b: float = 0.4, power: float = 2.0, m_b: fl
     return leaf
 
 
-def obstacle_geometry(provider, center, radius: float, k_b: float = 1.0, power: float = 2.0,
-                      m_b: float = 2.0, margin: float = 0.0, eps: float = 1e-3,
-                      site_name: Optional[str] = None):
-    """Barrier geometry that keeps the tracked site outside a sphere obstacle.
+def sdf_barrier_geometry(dist, k_b: float = 1.0, power: float = 2.0, m_b: float = 2.0,
+                         d0: Optional[float] = None, margin: float = 0.0, eps: float = 1e-3):
+    """Barrier *geometry* on any signed-distance field ``dist(q, params) -> (1,)``.
 
-    Task map is the signed distance ``d(q) = ||p_site(q) - center|| - radius`` (see
-    :func:`fabrix.maps.sphere_sdf_map`); the 1-D barrier repels when the site approaches the
-    surface, then is pulled back to config space through the SDF Jacobian (with its curvature
-    term). ``center`` is baked at construction (static); lifting it to a traced param gives a
-    reactive moving-obstacle fabric with no structural change.
+    The shared core of obstacle/plane avoidance: a 1-D HD2 barrier on the distance, repelling while
+    the site approaches the surface, pulled back to config space through the distance Jacobian (with
+    its curvature term). ``dist`` is passed ``params`` too, so the surface can move at runtime (a
+    traced obstacle center) with no structural change — autodiff differentiates ``q`` only.
+
+    ``d0`` optionally localizes the deflection: the priority *metric* is faded out (smooth C1 band)
+    beyond ``d0`` of the surface, so the geometry only bends the path within that range. Without it
+    the ``m_b / d`` metric reaches (weakly) at every approaching distance, which makes the arm start
+    detouring from far away. The HD2 acceleration is left untouched, so the path stays speed-independent.
     """
-    phi = sphere_sdf_map(provider, center, radius, site_name=site_name)
 
     def leaf(q, qd, params):
+        phi = lambda qq: dist(qq, params)                       # noqa: E731  (q-only for autodiff)
         x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(1,) J:(1,nq) Jdq:(1,)
         d = jnp.clip(x[0] - margin, eps, None)
         dd = (J @ qd)[0]
         a_g = _barrier_accel(d, dd, k_b, power)                 # scalar, away from surface (+d)
-        m = _barrier_metric(d, dd, m_b)                         # scalar
-        M = m.reshape(1, 1)
-        f = (-m * a_g).reshape(1)                               # f = -M a_des
-        return pullback(Spec(M, f), J, Jdq)
+        m = _barrier_metric(d, dd, m_b)                         # scalar priority weight
+        if d0 is not None:
+            m = m * _band(d, d0)                                # fade priority out beyond d0
+        return pullback(Spec(m.reshape(1, 1), (-m * a_g).reshape(1)), J, Jdq)
 
     return leaf
+
+
+def _sphere_dist(provider, center, radius, site_name):
+    """Distance fn ``(q, params) -> (1,)`` for a sphere; ``center=None`` reads
+    ``params.obstacle_center`` (a draggable / moving obstacle)."""
+    if center is None:
+        return lambda q, params: sphere_sdf_map(provider, params.obstacle_center, radius,
+                                                site_name=site_name)(q)
+    phi = sphere_sdf_map(provider, center, radius, site_name=site_name)
+    return lambda q, params: phi(q)
+
+
+def obstacle_geometry(provider, center, radius: float, k_b: float = 1.0, power: float = 2.0,
+                      m_b: float = 2.0, d0: Optional[float] = None, margin: float = 0.0,
+                      eps: float = 1e-3, site_name: Optional[str] = None):
+    """Barrier geometry that keeps the tracked site outside a sphere obstacle.
+
+    Task map is the signed distance ``d(q) = ||p_site(q) - center|| - radius``; the 1-D barrier
+    repels when the site approaches the surface, pulled back through the SDF Jacobian (with its
+    curvature term). ``center`` is a fixed point (baked, static obstacle) or ``None`` to read
+    ``params.obstacle_center`` each step — a reactive moving/draggable-obstacle fabric. ``d0``
+    localizes the deflection to within that distance of the surface (see :func:`sdf_barrier_geometry`).
+    """
+    return sdf_barrier_geometry(_sphere_dist(provider, center, radius, site_name),
+                                k_b=k_b, power=power, m_b=m_b, d0=d0, margin=margin, eps=eps)
+
+
+def plane_geometry(provider, point, normal, k_b: float = 1.0, power: float = 2.0, m_b: float = 2.0,
+                   d0: Optional[float] = None, margin: float = 0.0, eps: float = 1e-3,
+                   site_name: Optional[str] = None):
+    """Barrier geometry keeping the tracked site on the ``+normal`` side of a plane (e.g. a floor).
+
+    Distance is ``d(q) = normal . (p_site(q) - point)`` (see :func:`fabrix.maps.plane_sdf_map`).
+    ``d0`` localizes the deflection to within that distance of the plane.
+    """
+    phi = plane_sdf_map(provider, point, normal, site_name=site_name)
+    return sdf_barrier_geometry(lambda q, params: phi(q),
+                                k_b=k_b, power=power, m_b=m_b, d0=d0, margin=margin, eps=eps)
 
 
 # ---------------------------------------------------------------------------
@@ -191,18 +232,18 @@ def joint_limit_potential(provider, k_p: float = 0.05, d0: float = 0.3, m_p: flo
     return leaf
 
 
-def obstacle_potential(provider, center, radius: float, k_p: float = 0.5, d0: float = 0.2,
-                       m_p: float = 4.0, margin: float = 0.0, eps: float = 1e-3,
-                       site_name: Optional[str] = None):
-    """Repulsive barrier potential keeping the tracked site outside a sphere (forcing leaf).
+def sdf_barrier_potential(dist, k_p: float = 0.5, d0: float = 0.2, m_p: float = 4.0,
+                          margin: float = 0.0, eps: float = 1e-3):
+    """Repulsive barrier *potential* on any signed-distance field ``dist(q, params) -> (1,)``.
 
-    The position-only counterpart to :func:`obstacle_geometry`: its force diverges at the surface,
-    so it can halt even a head-on approach — this is the leaf that makes non-penetration a hard
-    invariant. Localized to the standoff band ``d0``.
+    The shared core of the obstacle/plane potentials: a diverging potential force on the distance,
+    localized to the standoff band ``d0``. This — not the geometry — makes the clearance a hard
+    invariant (the diverging potential is unreachable with finite kinetic energy). Pair with the
+    matching geometry. ``dist`` is passed ``params`` so the surface can move at runtime.
     """
-    phi = sphere_sdf_map(provider, center, radius, site_name=site_name)
 
     def leaf(q, qd, params):
+        phi = lambda qq: dist(qq, params)                       # noqa: E731  (q-only for autodiff)
         x, J, Jdq = value_jac_curv(phi, q, qd)
         d = jnp.clip(x[0] - margin, eps, None)
         f = _barrier_potential_grad(d, k_p, d0).reshape(1)      # task-space potential force
@@ -210,3 +251,24 @@ def obstacle_potential(provider, center, radius: float, k_p: float = 0.5, d0: fl
         return pullback(Spec(m, f), J, Jdq)
 
     return leaf
+
+
+def obstacle_potential(provider, center, radius: float, k_p: float = 0.5, d0: float = 0.2,
+                       m_p: float = 4.0, margin: float = 0.0, eps: float = 1e-3,
+                       site_name: Optional[str] = None):
+    """Repulsive barrier potential keeping the tracked site outside a sphere (forcing leaf).
+
+    The position-only counterpart to :func:`obstacle_geometry`: its force diverges at the surface,
+    so it can halt even a head-on approach — the leaf that makes non-penetration a hard invariant.
+    ``center=None`` reads ``params.obstacle_center`` (draggable). Localized to the standoff band ``d0``.
+    """
+    return sdf_barrier_potential(_sphere_dist(provider, center, radius, site_name),
+                                 k_p=k_p, d0=d0, m_p=m_p, margin=margin, eps=eps)
+
+
+def plane_potential(provider, point, normal, k_p: float = 0.5, d0: float = 0.2, m_p: float = 4.0,
+                    margin: float = 0.0, eps: float = 1e-3, site_name: Optional[str] = None):
+    """Repulsive barrier potential keeping the tracked site on the ``+normal`` side of a plane."""
+    phi = plane_sdf_map(provider, point, normal, site_name=site_name)
+    return sdf_barrier_potential(lambda q, params: phi(q),
+                                 k_p=k_p, d0=d0, m_p=m_p, margin=margin, eps=eps)
