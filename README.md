@@ -9,9 +9,9 @@ vibrate. `fabrix` is built on autodiff: the task Jacobian and the curvature term
 straight from `jax.jacfwd` / nested `jvp`, so the whole policy is `jit`-fast and correct by
 construction.
 
-**Status: Milestones 1–2 complete** — a forced attractor fabric, then energized obstacle &
-joint-limit geometries, on a Kinova Gen3. Full plan, progress, and TODOs in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+**Status: Milestones 1–3 complete** (the full project scope) — a forced attractor fabric, then
+energized obstacle & joint-limit geometries, then full **SE(3) pose** tracking, on a Kinova Gen3.
+Full plan, progress, and TODOs in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Setup
 
@@ -30,6 +30,7 @@ cd mujoco_menagerie && git sparse-checkout set kinova_gen3 robotiq_2f85 && cd ..
 uv run pytest -q                          # correctness, convergence, smoothness, latency, invariants
 uv run python demos/attractor_reach.py    # M1 reach demo    -> demos/attractor_reach.png
 uv run python demos/obstacle_reach.py     # M2 reach + avoid -> demos/obstacle_reach.png
+uv run mjpython demos/interactive_track.py  # M3 live viewer: drag/rotate a 6-DOF target (macOS)
 ```
 
 ## Results
@@ -41,11 +42,16 @@ uv run python demos/obstacle_reach.py     # M2 reach + avoid -> demos/obstacle_r
 penetration**, joint limits **never violated**, energy conserved by energization; still C2 (max
 step-to-step `q̈` ≈ 0.31) at **~66 µs/step**.
 
+**M3 (full SE(3) pose):** tracks position **and** orientation — reach error **0.82 mm** / **0.019°**,
+C2-smooth, at **~88 µs/step** (float32). The error `Log(T*⁻¹T) ∈ se(3)` and its curvature term come
+straight from autodiff through `jaxlie`. `demos/interactive_track.py` is a live viewer: drag and
+rotate a 6-DOF target and watch the arm track it while avoiding an obstacle.
+
 ## Layout
 
 | path | contents |
 |---|---|
-| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`), `maps`, `leaves`, `fabric`, `integrate` |
+| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`, `site_pose`), `maps` (position / SDF / SE(3) pose), `leaves` (attractor, `pose_attractor`, posture, damping), `energy` (Finsler), `geometry` (energization + barriers), `fabric`, `integrate` |
 | `demos/` | runnable demos |
 | `tests/` | pytest suite |
 | `experiments/` | de-risking scratch (autodiff-FK correctness + latency studies) |

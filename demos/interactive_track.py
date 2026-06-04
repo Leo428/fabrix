@@ -1,17 +1,18 @@
-"""Interactive demo: drag a target, watch the Gen3 track it while avoiding an obstacle.
+"""Interactive demo: drag a target, watch the Gen3 track it while avoiding obstacles.
 
-A live MuJoCo viewer. Double-click the GREEN target sphere, then Ctrl + right-drag to move it;
-the geometric fabric drives the end-effector to follow — smoothly routing around the RED obstacle
-and respecting joint limits. The arm shows the *commanded* configuration (the fabric integrated to
-a joint reference), i.e. the C2-smooth stream a real servo would track quietly.
+A live MuJoCo viewer. Double-click the GREEN target, then Ctrl + right-drag to move it and
+Ctrl + left-drag to rotate it; the geometric fabric drives the end-effector to follow that full
+6-DOF pose (M3) — smoothly routing around the RED obstacle (also draggable), staying above the
+FLOOR, and respecting joint limits. The arm shows the *commanded* configuration (the fabric
+integrated to a joint reference), i.e. the C2-smooth stream a real servo would track quietly.
 
 macOS needs mjpython (the interactive viewer must own the main thread):
 
     uv run mjpython demos/interactive_track.py        # macOS
     uv run python   demos/interactive_track.py        # Linux / Windows
 
-Headless self-check (no GUI; scripts a target sweep across the obstacle and reports tracking +
-clearance):
+Headless self-check (no GUI; sweeps the target across the obstacle and down toward the floor and
+reports clearances):
 
     uv run python demos/interactive_track.py --check
 """
@@ -29,42 +30,67 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
-from fabrix import (CustomFK, FabricParams, GeometricFabric, attractor, config_damping,
+from fabrix import (CustomFK, FabricParams, GeometricFabric, config_damping,
                     fixed_metric_energy, joint_limit_geometry, joint_limit_potential,
-                    obstacle_geometry, obstacle_potential, posture)
+                    obstacle_geometry, obstacle_potential, plane_geometry, plane_potential,
+                    pose_attractor, posture)
 
 GEN3 = "mujoco_menagerie/kinova_gen3/gen3.xml"
 SCENE = "mujoco_menagerie/kinova_gen3/scene.xml"
-OBSTACLE_CENTER = (0.5, 0.0, 0.15)   # in front, low; clear of the home EE (~0.43 up) at start
+OBSTACLE_CENTER = (0.5, 0.0, 0.15)   # initial spot; in front, low; clear of the home EE (~0.43 up)
 OBSTACLE_RADIUS = 0.08
+FLOOR_Z = 0.0                        # the scene's ground plane
 DT = 0.002        # 500 Hz control
 SUB = 8           # control steps per render (~60 Hz render)
 
+# Attractor / damping gains (tuned for responsiveness — "setting C": ~2x snappier than the M2
+# defaults, still critically damped). Raise POSE_K (with POSE_B = 2*sqrt(POSE_K)) for crisper.
+POSE_K, POSE_B = 36.0, 12.0
+CFG_DAMP = 2.0
+POSE_FMAX = 10.0   # saturating attractor: cap the restoring accel so far/commanded moves don't lunge
+                   # (incremental drag is unaffected — it only bites past ~POSE_FMAX/POSE_K of error)
+POSTURE_W = 1.0    # posture priority toward q_default (the upright nominal); a per-joint (nq,) array
+                   # also works — bias the shoulder/elbow hard, leave the wrist free for the task
+# Two distinct ranges (see the obstacle docstrings): the GEOMETRY sets how far out the arm begins
+# to smoothly bend its path around a surface; the POTENTIAL is the tight hard wall that guarantees
+# no penetration. Keep the deflection local and the wall tight.
+OBST_GEOM_D0 = 0.12   # start bending the path within 12 cm of the obstacle surface
+OBST_POT_D0 = 0.02    # hard-wall standoff: the non-penetration potential acts within 2 cm
+FLOOR_D0 = 0.12       # floor: cushion within 12 cm of the ground (geometry + potential)
+
 
 def build_model():
-    """`scene.xml` + a draggable mocap target + a static (visual-only) obstacle sphere."""
+    """`scene.xml` + a draggable mocap target (green) + a draggable mocap obstacle (red)."""
     spec = mujoco.MjSpec.from_file(SCENE)
     t = spec.worldbody.add_body(); t.name = "target"; t.mocap = True; t.pos = [0.45, 0.0, 0.5]
     tg = t.add_geom(); tg.type = mujoco.mjtGeom.mjGEOM_SPHERE; tg.size = [0.025, 0, 0]
     tg.rgba = [0.1, 0.9, 0.1, 0.8]; tg.contype = 0; tg.conaffinity = 0
-    o = spec.worldbody.add_body(); o.name = "obstacle"; o.pos = list(OBSTACLE_CENTER)
+    o = spec.worldbody.add_body(); o.name = "obstacle"; o.mocap = True; o.pos = list(OBSTACLE_CENTER)
     og = o.add_geom(); og.type = mujoco.mjtGeom.mjGEOM_SPHERE; og.size = [OBSTACLE_RADIUS, 0, 0]
     og.rgba = [0.9, 0.3, 0.3, 0.45]; og.contype = 0; og.conaffinity = 0
     model = spec.compile()
-    tb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target")
-    return model, int(model.body_mocapid[tb])
+    mid = lambda name: int(model.body_mocapid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)])
+    return model, mid("target"), mid("obstacle")
 
 
 def _controller():
-    """Build the provider, fabric, home state, and a jitted SUB-step integrator."""
+    """Build the provider, fabric, and a jitted SUB-step integrator.
+
+    The sphere obstacle is param-driven (``center=None`` -> ``params.obstacle_center``) so it can be
+    dragged live; the floor is a static plane barrier on the scene's ground plane.
+    """
     prov = CustomFK(GEN3)
     nq = prov.nq
-    center = jnp.asarray(OBSTACLE_CENTER, jnp.float32)
+    floor_pt, floor_n = (0.0, 0.0, FLOOR_Z), (0.0, 0.0, 1.0)
     fab = GeometricFabric(
-        geometries=[obstacle_geometry(prov, center, OBSTACLE_RADIUS), joint_limit_geometry(prov)],
-        forcing=[attractor(prov), posture(nq),
-                 obstacle_potential(prov, center, OBSTACLE_RADIUS), joint_limit_potential(prov)],
-        damping=[config_damping(nq, b=6.0)],
+        geometries=[obstacle_geometry(prov, None, OBSTACLE_RADIUS, d0=OBST_GEOM_D0),
+                    joint_limit_geometry(prov),
+                    plane_geometry(prov, floor_pt, floor_n, d0=FLOOR_D0)],
+        forcing=[pose_attractor(prov, k=POSE_K, b=POSE_B, f_max=POSE_FMAX), posture(nq, weight=POSTURE_W),
+                 obstacle_potential(prov, None, OBSTACLE_RADIUS, d0=OBST_POT_D0),
+                 plane_potential(prov, floor_pt, floor_n, d0=FLOOR_D0),
+                 joint_limit_potential(prov)],
+        damping=[config_damping(nq, b=CFG_DAMP)],
         energy=fixed_metric_energy(nq, jnp.float32))
 
     @jax.jit
@@ -84,7 +110,7 @@ def _controller():
 def main():
     import mujoco.viewer
 
-    model, mocap_id = build_model()
+    model, tgt_id, obs_id = build_model()
     prov, advance = _controller()
     nq = prov.nq
 
@@ -92,15 +118,21 @@ def main():
     mujoco.mj_resetDataKeyframe(model, data, 0)               # "home"
     q_home = jnp.asarray(data.qpos[:nq], jnp.float32)
     q, qd = q_home, jnp.zeros(nq, jnp.float32)
-    data.mocap_pos[mocap_id] = np.asarray(prov.site_pos(q))   # start the target at the EE (no jump)
+    # start the target at the EE pose (no jump in position or orientation); obstacle at its spot
+    data.mocap_pos[tgt_id] = np.asarray(prov.site_pos(q))
+    data.mocap_quat[tgt_id] = np.asarray(prov.site_rot(q))
+    data.mocap_pos[obs_id] = np.asarray(OBSTACLE_CENTER)
 
     print(__doc__)
-    print(">>> drag the GREEN target: double-click it, then Ctrl + right-drag <<<\n")
+    print(">>> double-click the GREEN target or RED obstacle, then Ctrl + right-drag (move) "
+          "/ Ctrl + left-drag (rotate the target) <<<\n")
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
             tic = time.perf_counter()
-            params = FabricParams(target=jnp.asarray(data.mocap_pos[mocap_id], jnp.float32),
-                                  q_default=q_home)
+            params = FabricParams(target=jnp.asarray(data.mocap_pos[tgt_id], jnp.float32),
+                                  q_default=q_home,
+                                  target_quat=jnp.asarray(data.mocap_quat[tgt_id], jnp.float32),
+                                  obstacle_center=jnp.asarray(data.mocap_pos[obs_id], jnp.float32))
             q, qd = advance(q, qd, params)
             data.qpos[:nq] = np.asarray(q)
             mujoco.mj_forward(model, data)
@@ -111,26 +143,50 @@ def main():
 
 
 def check():
-    """Headless: sweep the target straight across the obstacle; report tracking + clearance."""
-    model, mocap_id = build_model()
+    """Headless: sweep the target across the obstacle, then down toward the floor; report clearances
+    and the distance at which the arm *begins* to detour around the obstacle."""
+    model, _, _ = build_model()
     prov, advance = _controller()
     nq = prov.nq
     center = np.asarray(OBSTACLE_CENTER)
     q_home = jnp.asarray(model.key_qpos[0, :nq], jnp.float32)
-    q, qd = q_home, jnp.zeros(nq, jnp.float32)
+    quat_home = jnp.asarray(prov.site_rot(q_home), jnp.float32)  # hold orientation while sweeping
+    obs = jnp.asarray(OBSTACLE_CENTER, jnp.float32)
 
-    # target sweeps left->right at the obstacle's height; the straight line passes through it
-    ys = np.linspace(-0.35, 0.35, 600)
-    min_clear, max_track = np.inf, 0.0
-    for y in ys:
+    def params(tgt):
+        return FabricParams(target=tgt, q_default=q_home, target_quat=quat_home, obstacle_center=obs)
+
+    # (1) target sweeps left->right through the obstacle's center: the straight line penetrates it
+    q, qd = q_home, jnp.zeros(nq, jnp.float32)
+    for _ in range(400):                      # settle at the start so onset excludes startup catch-up
+        q, qd = advance(q, qd, params(jnp.asarray([center[0], -0.35, center[2]], jnp.float32)))
+    min_clear, onset = np.inf, 0.0
+    for y in np.linspace(-0.35, 0.35, 600):
         tgt = jnp.asarray([center[0], y, center[2]], jnp.float32)
-        q, qd = advance(q, qd, FabricParams(target=tgt, q_default=q_home))
+        q, qd = advance(q, qd, params(tgt))
         ee = np.asarray(prov.site_pos(q))
-        min_clear = min(min_clear, np.linalg.norm(ee - center) - OBSTACLE_RADIUS)
-        max_track = max(max_track, np.linalg.norm(ee - np.asarray(tgt)))
-    print(f"[check] target swept across obstacle: min clearance {min_clear*1e3:+.1f} mm "
-          f"({'CLEAR' if min_clear >= 0 else 'PENETRATED'}); peak tracking lag {max_track*1e3:.0f} mm "
-          f"(expected — the target line goes through the obstacle, so the EE detours)")
+        clear = float(np.linalg.norm(ee - center) - OBSTACLE_RADIUS)
+        # "detour" = deviation perpendicular to the sweep line (which runs along y at fixed x,z), so
+        # it isolates the obstacle's sideways push from the harmless along-track lag behind a moving target
+        perp = float(np.hypot(ee[0] - center[0], ee[2] - center[2]))
+        min_clear = min(min_clear, clear)
+        if perp > 0.01:                      # detouring; track the largest clearance where it does
+            onset = max(onset, clear)
+    print(f"[obstacle] swept through center: min clearance {min_clear*1e3:+.1f} mm "
+          f"({'CLEAR' if min_clear >= 0 else 'PENETRATED'}); arm begins to detour at "
+          f"~{onset*1e3:.0f} mm clearance (was ~150-200 mm before tuning d0)")
+
+    # (2) target descends toward the floor, away from the obstacle: tests the plane barrier
+    q, qd = q_home, jnp.zeros(nq, jnp.float32)
+    for _ in range(400):
+        q, qd = advance(q, qd, params(jnp.asarray([0.45, 0.25, 0.45], jnp.float32)))
+    min_z = np.inf
+    for z in np.linspace(0.45, -0.10, 500):
+        tgt = jnp.asarray([0.45, 0.25, z], jnp.float32)
+        q, qd = advance(q, qd, params(tgt))
+        min_z = min(min_z, float(prov.site_pos(q)[2]))
+    print(f"[floor] target driven below ground: min EE height {min_z*1e3:+.1f} mm "
+          f"({'ABOVE floor' if min_z >= FLOOR_Z else 'BELOW floor'})")
     assert bool(jnp.all(jnp.isfinite(q)))
 
 

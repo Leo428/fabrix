@@ -14,6 +14,8 @@ Gains are baked at construction (mink-style); ``params.target``/``params.q_defau
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import jax.numpy as jnp
 
 from fabrix.diff import value_jac_curv
@@ -21,11 +23,28 @@ from fabrix.maps import se3_pose_error_map, site_position_map
 from fabrix.spec import Spec, pullback
 
 
-def attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0):
-    """EE-position attractor. Desired accel ``-(k(x-x*) + b ẋ)``; priority metric ``m·I₃``.
+def _restoring(e, k: float, f_max: Optional[float], eps: float = 1e-3):
+    """Restoring 'force' of an attractor potential as a function of the task error ``e``.
+
+    ``f_max=None`` → quadratic potential: gradient ``k·e`` (force grows without bound, so a far
+    target commands a large acceleration). Otherwise a **gradient-saturating** potential: magnitude
+    ``k·‖e‖`` near the goal (same stiffness/feel as the quadratic) but capped at ``f_max`` far away,
+    so the commanded acceleration stays bounded no matter how distant the target — gentle, lunge-free
+    large moves. ``f(e) = f_max·tanh(k‖e‖/f_max)·ê``; the softened norm keeps it smooth at ``e=0``.
+    """
+    if f_max is None:
+        return k * e
+    r = jnp.sqrt(e @ e + eps * eps)              # softened norm: smooth + NaN-free at e=0
+    return f_max * jnp.tanh(k * r / f_max) * (e / r)
+
+
+def attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
+              f_max: Optional[float] = None):
+    """EE-position attractor. Desired accel ``-(g(x-x*) + b ẋ)``; priority metric ``m·I₃``.
 
     ``k`` sets stiffness (ω=√k), ``b`` damping (b=2√k is critical), ``m`` the task priority
-    relative to posture/damping. ``f = M @ (k(x-x*) + b ẋ)`` pulled back to config space.
+    relative to posture/damping. ``g`` is the restoring force: quadratic (``k·e``) by default, or
+    gradient-saturating with magnitude capped at ``f_max`` (see :func:`_restoring`).
     """
     phi = site_position_map(provider)
 
@@ -33,20 +52,22 @@ def attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0):
         x, J, Jdq = value_jac_curv(phi, q, qd)
         xd = J @ qd
         M = m * jnp.eye(3, dtype=x.dtype)
-        f = m * (k * (x - params.target) + b * xd)  # = -M @ a_des
+        f = m * (_restoring(x - params.target, k, f_max) + b * xd)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
     return leaf
 
 
-def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0):
+def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
+                   f_max: Optional[float] = None):
     """Full 6-DOF SE(3) pose attractor. Drives the coupled pose error to zero.
 
     Task = ``e(q) = Log(T*^{-1} T(q)) in se(3)`` (``params.target`` position + ``params.target_quat``
-    orientation, wxyz). Desired accel ``-(k e + b ė)``; priority metric ``m·I₆`` (one shared metric
-    over the 6 twist coordinates, the coupled-SE(3) choice). ``f = M @ (k e + b ė)`` pulled back to
-    config space. Use alongside :func:`posture`/:func:`config_damping` to resolve the arm's
-    redundancy; the error couples translation and rotation, so the approach is a geodesic screw.
+    orientation, wxyz). Desired accel ``-(g(e) + b ė)``; priority metric ``m·I₆`` (one shared metric
+    over the 6 twist coordinates, the coupled-SE(3) choice). ``g`` is the restoring force: quadratic
+    by default, or gradient-saturating capped at ``f_max`` (bounded accel on far/commanded moves; note
+    one ``f_max`` mixes the translation (m) and rotation (rad) scales of the 6-D twist). Use alongside
+    :func:`posture`/:func:`config_damping` to resolve redundancy; the approach is a geodesic screw.
     """
 
     def leaf(q, qd, params):
@@ -54,18 +75,33 @@ def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0):
         e, J, Jdq = value_jac_curv(phi, q, qd)
         ed = J @ qd
         M = m * jnp.eye(6, dtype=e.dtype)
-        f = m * (k * e + b * ed)  # = -M @ a_des
+        f = m * (_restoring(e, k, f_max) + b * ed)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
     return leaf
 
 
-def posture(nq: int, k: float = 1.0, b: float = 2.0, weight: float = 0.5):
-    """Config-space attractor toward a nominal posture; low priority → acts in the nullspace."""
+def posture(nq: int, k=1.0, b: float = 2.0, weight=0.5):
+    """Config-space attractor toward ``params.q_default``; low priority → acts in the nullspace.
+
+    Resolves the arm's redundancy toward a nominal (e.g. upright/compact) posture without biasing the
+    EE. ``weight`` and ``k`` may be scalars **or per-joint ``(nq,)`` arrays** — use a per-joint
+    ``weight`` to hold the uprightness-critical joints (shoulder/elbow) firmly toward ``q_default``
+    while leaving the wrist free for the task. Per-joint ``weight`` cancels from the isolated
+    acceleration, so it only re-weights priority (which joints win the spare DOF), never the target.
+
+    Ceiling worth knowing: posture acts only in the *task nullspace*. A full 6-DOF pose task leaves a
+    7-DOF arm just 1 spare DOF (the elbow swivel), so posture's reach there is small; a position-only
+    (or low-orientation-weight) task frees 4 DOF and posture becomes far more effective. Hard
+    "never enter this pose" guarantees come from joint-limit barriers, not posture.
+    """
+    w = jnp.asarray(weight)
+    kk = jnp.asarray(k)
 
     def leaf(q, qd, params):
-        M = weight * jnp.eye(nq, dtype=q.dtype)
-        f = weight * (k * (q - params.q_default) + b * qd)  # = -M @ a_des
+        wv = jnp.broadcast_to(w, (nq,)).astype(q.dtype)
+        M = jnp.diag(wv)
+        f = wv * (kk * (q - params.q_default) + b * qd)  # = -M @ a_des (per-joint weight cancels in a_des)
         return Spec(M, f)
 
     return leaf

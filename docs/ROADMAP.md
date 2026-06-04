@@ -1,7 +1,7 @@
 # fabrix — Roadmap, Status & TODOs
 
-Living design+status doc. Project scope is **M1 → M3**. (M4-style batched-RL / learnable
-fabrics and hardware StableHLO/AOT export are explicitly out of scope.)
+Living design+status doc. Project scope is **M1 → M3** — **all complete** (2026-06). (M4-style
+batched-RL / learnable fabrics and hardware StableHLO/AOT export are explicitly out of scope.)
 
 ---
 
@@ -96,31 +96,72 @@ Turns the forced base case into a *full* geometric fabric.
 - **Files:** `fabrix/{energy,geometry}.py`, `GeometricFabric`, SDF maps; `demos/obstacle_reach.py`
   (→ `obstacle_reach.png`); `tests/test_m2.py`.
 
-### ☐ M3 — orientation / full SE(3) pose (PROJECT ENDPOINT)
-- [ ] Extend `CustomFK` with `site_pose(q) -> (pos, quat)` (orientation is already available as
-  `qmul(qw[site_body], site_quat)` in the FK — cheap to add).
-- [ ] `maps.py`: SE(3) pose map; pose error `= Log(T_target⁻¹ T_current) ∈ se(3)` via
-  **jaxlie** (`SE3.from_rotation_and_translation`, `.inverse()`, `@`, `.log()`).
-- [ ] 6-DOF pose attractor leaf; `J`/`J̇q̇` through the jaxlie expression by autodiff (verify the
-  nested `jvp` flows through jaxlie). Tests: position+orientation convergence, smoothness.
-- [ ] Demo: upgrade `interactive_track.py` to also track the mocap target's **orientation** (read
-  `mocap_quat`, 6-DOF target) — supplies the rotation tracking the interactive demo currently lacks.
+### ✅ M3 — orientation / full SE(3) pose (PROJECT ENDPOINT — DONE)
+Adds orientation, completing the M1→M3 scope: the fabric now tracks a full 6-DOF pose.
+- **`CustomFK.site_pose(q) -> (pos, quat)`** — the body loop already carries every body's world
+  quat, so orientation is one extra `_qmul(qw[site_body], site_quat)`; the position hot path
+  (`site_pos`) shares the same loop unchanged. Including the site's *local* frame mattered: the Gen3
+  `pinch_site` has `site_quat = [0,1,0,0]` (180° about x), which the old position-only FK dropped.
+  Verified vs MuJoCo `site_xpos`/`site_xmat` to **8.9e-16**.
+- **`se3_pose_error_map`** (`maps.py`) — `φ(q) = Log(T*⁻¹ T(q)) ∈ se(3)` (6,) via **jaxlie**
+  (`SO3.from_quaternion_xyzw` — note jaxlie is xyzw, MuJoCo wxyz — `SE3.from_rotation_and_translation`,
+  `.inverse()`, `@`, `.log()`). The **flagged risk cleared**: `jacfwd` *and* the nested-jvp curvature
+  flow through `SE3.log` (Taylor fallback keeps it finite at the identity); `J` vs finite-diff **3e-10**,
+  `J̇q̇` **5e-11** — same precision as the position maps. Output is cast to the config dtype (jaxlie
+  carries float64 constants that would otherwise promote a float32 config under `jax_enable_x64`).
+- **`pose_attractor`** leaf (`leaves.py`) — coupled SE(3): one 6-DOF error, priority metric `m·I₆`,
+  same `f = -M@a_des` pattern as the position attractor but in se(3); geodesic ("screw") approach.
+  `FabricParams` gained `target_quat` (wxyz, identity default → M1/M2 constructions unchanged).
+- **Design choice:** coupled **SE(3) Log** (geodesic, single 6D metric) over decoupled position⊕SO(3)
+  — user's call; matches the roadmap's original wording.
+- **Results:** pose reach **0.82 mm** + **0.019°**, C2-smooth; float32 pose policy **~88 µs/step**
+  (+22 µs over M2 for the SE(3) log, still ~9% of 1 kHz). `uv run pytest -q` → **25 passing**
+  (8 M1 + 11 M2 + 6 M3).
+- **Demo:** `interactive_track.py` now reads `mocap_quat` → full 6-DOF target (Ctrl+left-drag rotates
+  the target, and the arm tracks it — the rotation the demo previously ignored). `--check` 97 mm
+  clearance, stable.
+- **Files:** `kinematics.py` (`site_pose`/`site_rot`), `maps.py` (`se3_pose_error_map`, `_se3`),
+  `leaves.py` (`pose_attractor`), `fabric.py` (`FabricParams.target_quat`); `tests/test_m3.py`.
 
 ### Backlog / follow-ups (noted from the interactive demo, 2026-06)
-Driving `demos/interactive_track.py` surfaced these. None block M3; revisit after (or fold the
-rotation one into M3):
-- **Rotation tracking** — mocap can be rotated (Ctrl+left-drag) but the arm ignores it
-  (position-only). Lands with **M3** (above).
-- **Obstacle avoided from too far (~10–20 cm)** — the `obstacle_potential` standoff band is
-  `d0=0.2` (20 cm). Lower it (~0.08–0.12) for tighter avoidance. Tunable, not a bug.
-- **No ground/floor avoidance** — `plane_sdf_map` exists but no plane barrier leaf is wired in.
-  Generalize the obstacle leaves to take any task map (or add a plane variant) + add a ground
-  obstacle to the demo.
-- **Self-collision is NOT handled** — the arm avoids self-collision only *incidentally* (posture +
-  the motions tried); there are no self-collision leaves. Real support = pairwise body-distance task
-  maps (capsule/sphere proxies), a separate feature.
-- **Draggable obstacle** — lift the obstacle center to a traced `FabricParams` field (~10 lines) so
-  the obstacle can be dragged live too.
+Driving `demos/interactive_track.py` surfaced these. With M1→M3 complete these are post-scope polish:
+- **Rotation tracking** — ✅ **done in M3**: the demo reads `mocap_quat` and the `pose_attractor`
+  tracks the full 6-DOF target.
+- **Responsiveness** — ✅ **tuned**: bumped the demo to "setting C" (`pose_attractor` k=36/b=12,
+  `config_damping` b=2) — ~2× snappier reach, still critically damped. Measured time-to-1 mm 2.66 s → 1.46 s.
+- **Obstacle avoided from too far** — ✅ **fixed + generalized**: the early detour was the *geometry*
+  (its `m_b/d` metric reaches at all approaching distances), not the potential. Added an optional
+  standoff band `d0` to `sdf_barrier_geometry` (fades the priority metric out beyond `d0`, HD2
+  acceleration untouched). Demo: geometry `d0=0.12` (detour onset ~100 mm, was ~150–200) + potential
+  `d0=0.02` (tight 2 cm hard wall). Min clearance still +20 mm in the sweep-through-center test.
+- **Ground/floor avoidance** — ✅ **done**: generalized the obstacle leaves into `sdf_barrier_*`
+  taking any distance field; added `plane_geometry`/`plane_potential` and wired the scene's ground
+  plane into the demo (EE held ~80 mm above the floor when the target is driven below it).
+- **Draggable obstacle** — ✅ **done**: `obstacle_*` leaves accept `center=None` → read
+  `params.obstacle_center` (new `FabricParams` field); the demo's red ball is a second mocap body.
+- **Saturating attractor potential** — ✅ **done**: opt-in `f_max` on `attractor`/`pose_attractor`
+  (`_restoring`): magnitude `f_max·tanh(k‖e‖/f_max)·ê` — same stiffness near the goal, accel capped
+  far away so large/commanded moves don't lunge (on a 64 cm move, peak ‖q̈‖ 30.7 → 3.3 at f_max=8).
+  Demo uses `f_max=10`. Caveat: for coupled SE(3) one `f_max` mixes the translation (m) and rotation
+  (rad) scales of the twist. Doesn't speed the near-goal tail (that's stiffness).
+- **Wheelchair: keep the arm upright** — ✅ **#1 (soft posture bias) done**: `posture` now takes
+  per-joint `weight`/`k` (bias the shoulder/elbow toward `q_default`, leave the wrist free). **Key
+  finding:** a full 6-DOF pose task leaves only **1 nullspace DOF** on the 7-DOF arm, so scalar
+  posture barely shifts overall pose (weight 0.5→5 moved it 45.7°→44.6° but cost EE 0.5→4.7 mm);
+  posture's real reach is the elbow swivel + position-dominant tasks. `q_default` (= the home
+  keyframe today) **is** the upright nominal — set it from real wheelchair geometry later. Deferred
+  to when the arm is mounted + dimensions known:
+  - **#2 Hard joint no-go limits** — let `joint_limit_{geometry,potential}` take custom narrower
+    per-joint ranges (override the model's `jnt_range`) → a *guaranteed* no-go region. Small addition.
+  - **#3 Keep-out volume** (user's lap/torso) — a task-space plane/box barrier; to protect the elbow
+    and links (not just the EE) it needs the whole-arm collision spheres below.
+- **Self-collision / whole-arm obstacle avoidance** — *open*. The arm avoids self-collision only
+  *incidentally*; there are no self-collision leaves. Real support = **collision-sphere** proxies (a
+  few spheres rigidly attached per link), then a `sdf_barrier_*` leaf on each non-adjacent
+  sphere-pair distance (and each sphere vs each environment obstacle / keep-out volume — this is also
+  what #3 needs). Needs FK to arbitrary link frames (our `bodies(q)` loop already computes them —
+  expose per-body world transforms + sphere offsets) and `vmap` over pairs. NVIDIA fabrics / cuRobo
+  machinery. The barrier core (`sdf_barrier_*`) is already done and reusable.
 
 ### Out of scope
 M4-style batched-RL benchmarks / learnable fabrics; hardware StableHLO/AOT export. (Keep code
@@ -131,9 +172,10 @@ pure-functional + vmap-clean anyway — free hygiene.)
 ## Run
 
 ```bash
-uv run pytest -q                          # 19 tests
+uv run pytest -q                          # 25 tests (8 M1 + 11 M2 + 6 M3)
 uv run python demos/attractor_reach.py    # M1 -> demos/attractor_reach.png
 uv run python demos/obstacle_reach.py     # M2 -> demos/obstacle_reach.png
+uv run mjpython demos/interactive_track.py        # M3 drag-to-track 6-DOF pose (macOS; --check headless)
 ```
 
 ## Environment / facts

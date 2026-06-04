@@ -21,6 +21,7 @@ from fabrix import (
     CustomFK, Fabric, FabricParams, Spec, attractor, combine,
     config_damping, posture, pullback, resolve, rollout, value_jac_curv,
 )
+from fabrix.leaves import _restoring
 
 XML = str(pathlib.Path(__file__).resolve().parent.parent / "mujoco_menagerie/kinova_gen3/gen3.xml")
 
@@ -118,6 +119,63 @@ def test_smoothness(setup):
     assert float(jnp.abs(jnp.diff(qdd, axis=0)).max()) < 0.5
     # starts from rest
     assert float(jnp.abs(traj["qd"][0]).max()) < 0.1
+
+
+# ---------------- leaf enhancements: saturating attractor, per-joint posture ----------------
+def test_saturating_restoring():
+    # f_max=None is the plain quadratic gradient; with f_max set, the force matches k*e near zero
+    # (same stiffness) but its magnitude saturates at f_max far away, pointing along e throughout.
+    rng = np.random.default_rng(10)
+    k, f_max = 36.0, 8.0
+    e_small = jnp.array(rng.uniform(-1, 1, 6)) * 1e-4
+    assert jnp.allclose(_restoring(e_small, k, None), k * e_small)
+    assert float(jnp.linalg.norm(_restoring(e_small, k, f_max) - k * e_small)) < 1e-6
+    for s in (0.5, 2.0, 50.0):
+        e = jnp.array(rng.uniform(-1, 1, 6)); e = s * e / jnp.linalg.norm(e)
+        g = _restoring(e, k, f_max)
+        assert float(jnp.linalg.norm(g)) <= f_max + 1e-6           # never exceeds the cap
+        alpha = float((g @ e) / (e @ e))
+        assert alpha > 0 and float(jnp.linalg.norm(g - alpha * e)) < 1e-6   # parallel to e
+    e_far = 50.0 * jnp.ones(6) / jnp.linalg.norm(jnp.ones(6))
+    assert float(jnp.linalg.norm(_restoring(e_far, k, f_max))) > 0.99 * f_max  # saturated far away
+
+
+def test_saturating_attractor_bounds_acceleration(prov64):
+    # End-to-end: on a far target the saturating attractor caps the commanded acceleration well below
+    # the quadratic one (no lunge), while still converging.
+    nq = prov64.nq
+    q0 = jnp.zeros(nq)
+    far = prov64.site_pos(q0.at[1].set(0.7).at[3].set(0.7).at[5].set(-0.4))
+
+    def run(f_max):
+        fab = Fabric([attractor(prov64, k=36.0, b=12.0, f_max=f_max), posture(nq), config_damping(nq, b=2.0)])
+        tr = rollout(fab.policy, q0, jnp.zeros(nq), FabricParams(target=far, q_default=q0), 0.002, 4000, prov64.site_pos)
+        return float(jnp.max(jnp.abs(tr["qdd"]))), float(jnp.linalg.norm(tr["ee"][-1] - far))
+
+    quad_peak, quad_err = run(None)
+    sat_peak, sat_err = run(8.0)
+    assert sat_peak < 0.7 * quad_peak, f"saturating peak {sat_peak:.1f} vs quadratic {quad_peak:.1f}"
+    assert quad_err < 5e-3 and sat_err < 5e-3   # both reach the goal
+
+
+def test_posture_per_joint_weight(prov64):
+    # A per-joint posture weight holds the heavily-weighted joint nearer q_default than a uniform
+    # weight does, in a redundant (position-only) task — without losing EE convergence.
+    nq = prov64.nq
+    q0 = jnp.zeros(nq)
+    target = prov64.site_pos(q0.at[1].set(0.5).at[3].set(0.6).at[5].set(-0.3))
+    q_start = q0.at[1].set(0.1)
+
+    def final(weight):
+        fab = Fabric([attractor(prov64), posture(nq, weight=weight), config_damping(nq)])
+        tr = rollout(fab.policy, q_start, jnp.zeros(nq), FabricParams(target=target, q_default=q0),
+                     0.002, 2500, prov64.site_pos)
+        return tr["q"][-1], float(jnp.linalg.norm(tr["ee"][-1] - target))
+
+    q_uni, err_uni = final(0.5)                                   # uniform low weight
+    q_pj, err_pj = final(jnp.full(nq, 0.5).at[5].set(20.0))       # heavy on joint 5
+    assert err_uni < 5e-3 and err_pj < 5e-3                       # both still reach the EE target
+    assert abs(float(q_pj[5])) < abs(float(q_uni[5]))            # joint 5 held closer to q_default (0)
 
 
 # ---------------- performance guard ----------------
