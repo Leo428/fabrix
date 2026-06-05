@@ -30,7 +30,7 @@ from fabrix import (
     nonadjacent_pairs, pose_attractor, posture, rollout, self_collision_geometry,
     self_collision_potential,
 )
-from fabrix.collision import _centers
+from fabrix.collision import SphereModel, _body_id, _centers
 from fabrix.diff import value_jac_curv
 from fabrix.geometry import _pullback_diag
 from fabrix.spec import Spec, combine, pullback
@@ -244,3 +244,43 @@ def test_collision_latency_guard(prov32):
         ts.append(time.perf_counter() - s)
     us = min(ts) * 1e6
     assert us < 400.0, f"collision policy {us:.0f} us"  # measured ~124 us min; generous guard
+
+
+# ---------------- hand-tuning API (auto -> edit -> export -> reload) ----------------
+def test_to_dict_from_dict_roundtrip(prov):
+    # The hand-tuning pipeline's persistence: an auto model dumped to the from_dict literal and
+    # reloaded must reproduce the spheres exactly (lossless at micron precision), grouped by body.
+    sph = auto_arm_spheres(prov, 2)
+    spec = sph.to_dict(prov)
+    assert sum(len(v) for v in spec.values()) == len(sph)            # every sphere preserved
+    assert len(spec) == len(set(sph.names(prov)))                    # grouped by distinct body
+    back = SphereModel.from_dict(prov, spec)
+    assert np.array_equal(back.link, sph.link)                       # same links, same order
+    assert np.allclose(back.local, sph.local, atol=1e-6)
+    assert np.allclose(back.radius, sph.radius, atol=1e-6)
+
+
+def test_scaled_per_link(prov):
+    # scaled() multiplies only the named link's radii; everything else (radii, centers, links) is fixed.
+    sph = auto_arm_spheres(prov, 2)
+    fore = sph.link == _body_id(prov.mj_model, "forearm_link")
+    out = sph.scaled(prov, {"forearm_link": 0.5})
+    assert np.allclose(out.radius[fore], 0.5 * sph.radius[fore])
+    assert np.allclose(out.radius[~fore], sph.radius[~fore])         # other links untouched
+    assert np.array_equal(out.link, sph.link) and np.allclose(out.local, sph.local)
+    out.radius[0] = -1.0                                             # returned model is an independent copy
+    assert sph.radius[0] != -1.0
+
+
+def test_radius_scale_matches_scaled(prov):
+    # The auto-time radius_scale kwarg is exactly scaled() applied to the plain auto model.
+    base = auto_arm_spheres(prov, 2)
+    via_auto = auto_arm_spheres(prov, 2, radius_scale={"forearm_link": 0.7, "shoulder_link": 1.3})
+    via_scaled = base.scaled(prov, {"forearm_link": 0.7, "shoulder_link": 1.3})
+    assert np.allclose(via_auto.radius, via_scaled.radius)
+    assert np.array_equal(via_auto.link, base.link) and np.allclose(via_auto.local, base.local)
+
+
+def test_body_id_rejects_unknown(prov):
+    with pytest.raises(ValueError, match="unknown body"):
+        auto_arm_spheres(prov, 2, radius_scale={"no_such_link": 0.5})

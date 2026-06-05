@@ -36,6 +36,15 @@ from fabrix.kinematics import _qrot
 _SOFT = 1e-6  # softens the pairwise norm so its gradient stays finite if two centers coincide
 
 
+def _body_id(m, name: str) -> int:
+    """Resolve a body name to its id, raising a clear error if it is unknown."""
+    import mujoco
+    bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, name)
+    if bid < 0:
+        raise ValueError(f"unknown body {name!r}")
+    return int(bid)
+
+
 @dataclasses.dataclass(frozen=True)
 class SphereModel:
     """Collision spheres rigidly attached to link frames (a *static*, untraced description).
@@ -60,16 +69,39 @@ class SphereModel:
         ``(x, y, z)`` is the center in that body's frame, ``r`` the radius. The entry point for
         hand-tuning: start from :func:`auto_arm_spheres`, then refine specific links here.
         """
-        import mujoco
         m = provider.mj_model
         link, local, radius = [], [], []
         for name, spheres in spec.items():
-            bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, name)
-            if bid < 0:
-                raise ValueError(f"unknown body {name!r}")
+            bid = _body_id(m, name)
             for center, r in spheres:
                 link.append(bid); local.append(center); radius.append(r)
         return cls(np.array(link, int), np.array(local, float).reshape(-1, 3), np.array(radius, float))
+
+    def to_dict(self, provider, decimals: int = 6) -> Dict[str, List[Tuple]]:
+        """Dump to the ``from_dict`` format ``{body_name: [((x, y, z), r), ...]}`` (inverse of
+        :meth:`from_dict`). The committable hand-tuning artifact: export an auto model, edit, reload.
+
+        Spheres are grouped by body in index order; values are rounded to ``decimals`` for a readable,
+        diffable literal (6 = micron precision, so the round-trip is lossless at hardware tolerances).
+        """
+        names = self.names(provider)
+        out: Dict[str, List[Tuple]] = {}
+        for i, name in enumerate(names):
+            out.setdefault(name, []).append(
+                (tuple(round(float(x), decimals) for x in self.local[i]), round(float(self.radius[i]), decimals)))
+        return out
+
+    def scaled(self, provider, factors: Dict[str, float]) -> "SphereModel":
+        """Return a copy with per-link radius multipliers applied (``{body_name: factor}``).
+
+        Links not listed keep their radius. The one-liner for the common "auto over-covers a few links"
+        fix — e.g. ``sph.scaled(prov, {"forearm_link": 0.7})``. ``local`` and ``link`` are unchanged.
+        """
+        m = provider.mj_model
+        fac = np.ones(len(self))
+        for name, f in factors.items():
+            fac[self.link == _body_id(m, name)] = float(f)
+        return SphereModel(self.link.copy(), self.local.copy(), self.radius * fac)
 
     def names(self, provider) -> List[str]:
         """Body name each sphere rides on (for inspecting/tuning an auto-generated model)."""
@@ -98,22 +130,28 @@ def _child_offset(m, b: int) -> Optional[np.ndarray]:
     return None
 
 
-def auto_arm_spheres(provider, n_per_link: int = 2, radius: Optional[float] = None) -> SphereModel:
+def auto_arm_spheres(provider, n_per_link: int = 2, radius: Optional[float] = None,
+                     radius_scale: Optional[Dict[str, float]] = None) -> SphereModel:
     """Auto-place ``n_per_link`` spheres along each link's 'bone' (the segment toward its child joint).
 
     For every movable link, spheres sit at interior fractions of the bone in the link frame (so they
     cover the link body without piling up on the shared joints), with ``radius`` taken from the link's
     collision-mesh cross-section unless one is given. Reproducible and model-general; the batched leaves
     make the sphere count nearly free, so prefer over-covering. Hand-tune the result if a link needs it.
+
+    ``radius_scale`` (``{body_name: factor}``) multiplies the per-link radius for named links only — the
+    quick fix when the mesh cross-section over-covers a few links. Equivalent to
+    :meth:`SphereModel.scaled` on the result; for finer edits (move/add/drop) use the tuner + ``from_dict``.
     """
     m = provider.mj_model
+    scale = {_body_id(m, n): float(f) for n, f in (radius_scale or {}).items()}
     fracs = np.linspace(0.0, 1.0, n_per_link + 2)[1:-1]     # interior points, off the joints
     link, local, rad = [], [], []
     for b in range(1, m.nbody):                              # skip world (0)
         bone = _child_offset(m, b)
         if bone is None:
             continue
-        r = radius if radius is not None else _collision_radius(m, b)
+        r = (radius if radius is not None else _collision_radius(m, b)) * scale.get(b, 1.0)
         for t in fracs:
             link.append(b); local.append(t * bone); rad.append(r)
     return SphereModel(np.array(link, int), np.array(local, float).reshape(-1, 3), np.array(rad, float))
@@ -131,6 +169,27 @@ def nonadjacent_pairs(spheres: SphereModel, provider) -> np.ndarray:
     pairs = [(a, b) for a in range(len(L)) for b in range(a + 1, len(L))
              if L[a] != L[b] and parent[L[a]] != L[b] and parent[L[b]] != L[a]]
     return np.array(pairs, int).reshape(-1, 2)
+
+
+def load_spheres(provider, path, n_per_link: int = 2, **auto_kwargs) -> Tuple[SphereModel, bool]:
+    """Load hand-tuned spheres from ``path`` if it exists, else fall back to :func:`auto_arm_spheres`.
+
+    ``path`` is a Python module (e.g. one written by ``demos/tune_spheres.py``) exposing either a
+    ``load_tuned(provider)`` function or a ``SPHERES`` dict in :meth:`SphereModel.from_dict` form.
+    Returns ``(model, is_tuned)`` so callers can report which source was used. This is the runtime end
+    of the "auto first, hand-tune if needed" pipeline — a demo just calls it and uses whatever it gets.
+    """
+    import importlib.util
+    import pathlib
+    p = pathlib.Path(path)
+    if p.exists():
+        spec = importlib.util.spec_from_file_location("_fabrix_tuned_spheres", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        model = mod.load_tuned(provider) if hasattr(mod, "load_tuned") \
+            else SphereModel.from_dict(provider, mod.SPHERES)
+        return model, True
+    return auto_arm_spheres(provider, n_per_link=n_per_link, **auto_kwargs), False
 
 
 # ---------------------------------------------------------------------------
