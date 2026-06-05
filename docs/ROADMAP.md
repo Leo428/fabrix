@@ -181,6 +181,19 @@ Driving `demos/interactive_track.py` surfaced these. With M1→M3 complete these
   - Still deferred to real-arm dimensions: **#2** hard joint no-go limits, **#3** keep-out volume
     (the whole-arm sphere machinery #3 needs is now in place — add a keep-out plane/box barrier over the spheres).
 
+- **Tuning pass — gains, barrier bands, and self-collision sphere sizes/placement** — 🔲 **OPEN
+  (2026-06-05).** The demo runs well, but the values are set by feel and want a proper pass:
+  - **Self-collision spheres feel too restrictive.** The auto radius (collision-mesh `max(size[:2])`)
+    over-covers the bulkier links, so some non-adjacent links can't approach as closely as they
+    physically could. Trim radii / reposition / drop redundant spheres in `demos/tune_spheres.py`, and
+    revisit the auto-gen default (a thinner radius, or a per-link scale baked into `auto_arm_spheres`)
+    so the *starting* model is less conservative. Also consider excluding more never-colliding sphere
+    pairs in `nonadjacent_pairs` to cut spurious deflection.
+  - **Sweep the (now split) bands + gains**, currently hand-tuned in `interactive_track.py`: obstacle
+    `0.06/0.02`, self-collision `0.03/0.015`, floor `0.03/0.015`; posture `weight=2, k=2`; integrator
+    safety caps `QDD_MAX=50, QD_MAX=4`. Per-pair / per-link barrier *strength* (`m_b`/`k_b`) is an
+    unused lever beyond the `d0` bands.
+
 ### Performance profile (2026-06-04, CPU float32, single arm)
 Profiled the real 10-leaf demo fabric (permanent harness `bench/profile_fabrix.py` —
 `uv run python bench/profile_fabrix.py`).

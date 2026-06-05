@@ -69,7 +69,8 @@ POSTURE_K, POSTURE_B = 2.0, 2.83   # posture stiffness toward q_default (bâ‰ˆ2âˆ
 # no penetration. Keep the deflection local and the wall tight.
 OBST_GEOM_D0 = 0.06   # start bending the path within 6 cm of the obstacle surface
 OBST_POT_D0 = 0.02    # hard-wall standoff: the non-penetration potential acts within 2 cm
-FLOOR_D0 = 0.12       # floor: cushion within 12 cm of the ground (geometry + potential)
+FLOOR_GEOM_D0 = 0.03  # floor: start cushioning a sphere within 3 cm of the ground
+FLOOR_POT_D0 = 0.015  # floor: hard no-penetration wall within 1.5 cm (tighter than the deflection band)
 # Collision spheres: the obstacle/floor barriers now guard the WHOLE arm (every sphere), not just the
 # EE, and a self-collision barrier keeps non-adjacent links apart. Spheres are auto-placed from the
 # kinematics and drawn translucent blue in the viewer (for tuning); the count is nearly free (batched).
@@ -110,12 +111,12 @@ def _controller():
         geometries=[arm_obstacle_geometry(prov, sph, None, OBSTACLE_RADIUS, d0=OBST_GEOM_D0),
                     self_collision_geometry(prov, sph, pairs, d0=SELF_GEOM_D0),
                     joint_limit_geometry(prov),
-                    arm_plane_geometry(prov, sph, floor_pt, floor_n, d0=FLOOR_D0)],
+                    arm_plane_geometry(prov, sph, floor_pt, floor_n, d0=FLOOR_GEOM_D0)],
         forcing=[pose_attractor(prov, k=POSE_K, b=POSE_B, f_max=POSE_FMAX),
                  posture(nq, k=POSTURE_K, b=POSTURE_B, weight=POSTURE_W),
                  arm_obstacle_potential(prov, sph, None, OBSTACLE_RADIUS, d0=OBST_POT_D0),
                  self_collision_potential(prov, sph, pairs, d0=SELF_POT_D0),
-                 arm_plane_potential(prov, sph, floor_pt, floor_n, d0=FLOOR_D0),
+                 arm_plane_potential(prov, sph, floor_pt, floor_n, d0=FLOOR_POT_D0),
                  joint_limit_potential(prov)],
         damping=[config_damping(nq, b=CFG_DAMP)],
         energy=fixed_metric_energy(nq, jnp.float32))
