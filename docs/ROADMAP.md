@@ -208,16 +208,25 @@ Profiled the real 10-leaf demo fabric (permanent harness `bench/profile_fabrix.p
 - **Scaling (the collision decision):** N obstacle barriers, separate leaves vs one batched leaf —
   N=64: separate **41 s compile / 235 µs**, batched **2.7 s compile (flat) / 131 µs**, `max|Δq̈|=0`.
 
-### Code-quality backlog (#2–#7, from the 2026-06 profile — deferred, low value)
-Minor / cosmetic; XLA already absorbs most. Park here, revisit opportunistically (e.g. when editing
-the file anyway). #1 (batched barriers) and #8 (per-link FK) are **done** — see the self-collision
-entry above.
-- **#2** `value_jac_curv` evals the primal `x = phi(q)` that `jacfwd(phi)(q)` also recomputes (redundant primal).
-- **#3** `J @ qd` computed twice in barrier leaves (explicit `dd`, and again as the primal of the curvature jvp).
-- **#4** `d ** power` with `power=2.0` (float pow) instead of `d*d` in `_barrier_accel`.
-- **#5** `obstacle_*(center=None)` rebuilds the `sphere_sdf_map` closure inside the leaf each trace (harmless, hoistable).
-- **#6** `resolve` has no graceful fallback if the metric is non-PD (relies on posture+damping invariant; reg=1e-6). Document louder.
-- **#7** `combine` Python-loop sum — fine for static small N; the batched design sidesteps it for collision.
+### Code-quality backlog (#2–#7, from the 2026-06 profile) — triaged 2026-06-05
+Reviewed against the actual code (and HLO where the answer was empirical). Outcome: one doc fix
+landed; the rest are confirmed non-issues XLA already absorbs, so they are **closed, not parked**.
+#1 (batched barriers) and #8 (per-link FK) were done earlier — see the self-collision entry above.
+- **#2 — dropped (not real).** `x = phi(q)` and the primal inside `jacfwd(phi)(q)` are identical pure
+  ops on the same input; XLA CSEs them to one. The explicit `x =` is also the clearest return.
+- **#3 — dropped (real but negligible + churny).** The jvp-primal `J@qd` is a *mandatory* byproduct of
+  the curvature `Jdq` (forward mode computes primal+tangent together), so it is computed regardless;
+  the explicit `dd = J@qd` is one fused matvec on the already-materialized `J`. Exposing the primal
+  would change the public `value_jac_curv` signature (used in 3 tests) and add a `Jqd`/`Jdq` naming
+  hazard to save a fused dot — net negative.
+- **#4 — dropped (not real, HLO-verified).** `d**2.0` compiles to 0 power/exp/log ops, pure `multiply`
+  — XLA's algebraic simplifier already folds `pow(x, 2.0) -> x*x`. `power` stays a general knob.
+- **#5 — dropped (not real).** The closure is rebuilt only at *trace* time (Python construction); the
+  runtime graph is CSE'd to zero extra cost. A fix would need a `maps` API change for no runtime gain.
+- **#6 — done.** Documented `resolve`'s silent non-PD failure mode (NaN under jit → integrator blow-up,
+  the same class as the fly-away bug) and that the SPD-by-construction invariant is the contract.
+- **#7 — dropped (not real).** The static-length loop unrolls at trace; XLA reassociates the add chain.
+  `jnp.stack`+sum would be *worse* (materializes a stack). The loop is the clearest form.
 
 ### Out of scope
 M4-style batched-RL benchmarks / learnable fabrics; hardware StableHLO/AOT export. (Keep code

@@ -54,7 +54,14 @@ def resolve(spec: Spec, reg: float = 1e-6) -> jnp.ndarray:
     """Solve ``M qddot + f = 0`` for ``qddot`` with Tikhonov regularization.
 
     The combined root metric is SPD (posture + config-damping make it full-rank), so we
-    solve via Cholesky rather than forming an inverse.
+    solve via Cholesky rather than forming an inverse. ``reg`` floors the smallest eigenvalue,
+    keeping the factor well-conditioned even when a barrier metric momentarily dominates.
+
+    **Failure mode (silent):** Cholesky assumes ``M + reg I`` is positive-definite. Under
+    ``jit`` a non-PD metric does *not* raise — ``cho_factor`` returns NaNs that propagate
+    into ``qddot`` and then explode the integrator (the same blow-up class as an unbounded
+    barrier). There is no graceful fallback by design: the SPD-by-construction invariant above
+    is the contract, so always keep at least one PD leaf (posture/damping) in the root combine.
     """
     n = spec.M.shape[0]
     M = spec.M + reg * jnp.eye(n, dtype=spec.M.dtype)
