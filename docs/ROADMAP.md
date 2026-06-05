@@ -189,10 +189,12 @@ Driving `demos/interactive_track.py` surfaced these. With M1→M3 complete these
     revisit the auto-gen default (a thinner radius, or a per-link scale baked into `auto_arm_spheres`)
     so the *starting* model is less conservative. Also consider excluding more never-colliding sphere
     pairs in `nonadjacent_pairs` to cut spurious deflection.
-  - **Sweep the (now split) bands + gains**, currently hand-tuned in `interactive_track.py`: obstacle
+  - **Sweep the (now split) bands + gains** — now tunable **live** via the `interactive_track.py`
+    viser panel (gains ride in traced params, so sliders retune with no recompile): obstacle
     `0.06/0.02`, self-collision `0.03/0.015`, floor `0.03/0.015`; posture `weight=2, k=2`; integrator
     safety caps `QDD_MAX=50, QD_MAX=4`. Per-pair / per-link barrier *strength* (`m_b`/`k_b`) is an
-    unused lever beyond the `d0` bands.
+    exposed-but-unswept lever beyond the `d0` bands. The panel makes the *sweep* fast; the remaining
+    work is committing good values back as the new `Gains()` defaults.
 
 ### Performance profile (2026-06-04, CPU float32, single arm)
 Profiled the real 10-leaf demo fabric (permanent harness `bench/profile_fabrix.py` —

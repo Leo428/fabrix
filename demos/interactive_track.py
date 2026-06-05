@@ -23,6 +23,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 import pathlib
 import sys
+from typing import NamedTuple
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))  # repo root on sys.path
 
@@ -48,34 +49,55 @@ OBSTACLE_RADIUS = 0.08
 FLOOR_Z = 0.0                        # the scene's ground plane
 DT = 0.01         # 100 Hz control — one policy eval per render; ~5x cooler than 500 Hz on a laptop
 SUB = 1           # one control step per render; the loop caps the wall rate to 1/(SUB*DT) = 100 Hz
-# Safety caps on the integrated reference. The barrier's approach-rate term sees only the ARM's motion,
-# not the obstacle's, so a *fast-dragged* obstacle isn't anticipated — d collapses, the 1/d^2 wall spikes,
-# and explicit Euler at 100 Hz would fling the arm to NaN. These per-joint caps (a real servo has them)
-# bound the per-step jump so it can't blow up; they only bite on such pathological inputs.
-QDD_MAX = 50.0    # rad/s^2  reactive-acceleration cap
-QD_MAX = 4.0      # rad/s    joint-velocity cap (bounds the per-step q change)
 
-# Attractor / damping gains (tuned for responsiveness — "setting C": ~2x snappier than the M2
-# defaults, still critically damped). Raise POSE_K (with POSE_B = 2*sqrt(POSE_K)) for crisper.
-POSE_K, POSE_B = 36.0, 12.0
-CFG_DAMP = 2.0
-POSE_FMAX = 10.0   # saturating attractor: cap the restoring accel so far/commanded moves don't lunge
-                   # (incremental drag is unaffected — it only bites past ~POSE_FMAX/POSE_K of error)
-POSTURE_W = 2.0    # posture priority toward q_default (the upright nominal); a per-joint (nq,) array
-                   # also works — bias the shoulder/elbow hard, leave the wrist free for the task
-POSTURE_K, POSTURE_B = 2.0, 2.83   # posture stiffness toward q_default (b≈2√k, critically damped)
-# Two distinct ranges (see the obstacle docstrings): the GEOMETRY sets how far out the arm begins
-# to smoothly bend its path around a surface; the POTENTIAL is the tight hard wall that guarantees
-# no penetration. Keep the deflection local and the wall tight.
-OBST_GEOM_D0 = 0.06   # start bending the path within 6 cm of the obstacle surface
-OBST_POT_D0 = 0.02    # hard-wall standoff: the non-penetration potential acts within 2 cm
-FLOOR_GEOM_D0 = 0.03  # floor: start cushioning a sphere within 3 cm of the ground
-FLOOR_POT_D0 = 0.015  # floor: hard no-penetration wall within 1.5 cm (tighter than the deflection band)
-# Collision spheres: the obstacle/floor barriers now guard the WHOLE arm (every sphere), not just the
-# EE, and a self-collision barrier keeps non-adjacent links apart. Spheres are auto-placed from the
-# kinematics and drawn translucent blue in the viewer (for tuning); the count is nearly free (batched).
-SELF_GEOM_D0 = 0.03   # self-collision: start deflecting two links apart within 3 cm of contact
-SELF_POT_D0 = 0.015   # hard self-collision wall: the no-penetration potential acts within 1.5 cm
+
+class Gains(NamedTuple):
+    """Every live-tunable fabric gain, as a JAX pytree the slider panel rewrites each step.
+
+    These ride in ``FabricParams.gains`` and the fabric is built with *callable* gains
+    (``lambda p: p.gains.<field>``), so changing any value is a **traced input change**: the next
+    control step uses it with **no recompile** (the same trick that lets ``params.target`` move every
+    frame). The defaults are the known-good M3 tuning, so ``Gains()`` reproduces the prior behavior.
+
+    Each barrier splits into a wider GEOMETRY deflection band + a tighter POTENTIAL hard wall;
+    ``*_d0`` = onset distance (m), ``*_kb``/``*_kp`` = strength, ``*_mb``/``*_mp`` = priority metric.
+    """
+    # task pose attractor: stiffness, damping (≈2√k critical), priority metric, saturating accel cap
+    pose_k: float = 36.0
+    pose_b: float = 12.0
+    pose_m: float = 50.0
+    pose_fmax: float = 10.0
+    # posture (nullspace → upright nominal) + global joint damping
+    posture_w: float = 2.0
+    posture_k: float = 2.0
+    posture_b: float = 2.83
+    cfg_damp: float = 2.0
+    # obstacle barrier (whole-arm)
+    obst_geom_d0: float = 0.06
+    obst_geom_kb: float = 1.0
+    obst_geom_mb: float = 2.0
+    obst_pot_d0: float = 0.02
+    obst_pot_kp: float = 0.5
+    obst_pot_mp: float = 4.0
+    # self-collision barrier (non-adjacent link pairs)
+    self_geom_d0: float = 0.03
+    self_geom_kb: float = 1.0
+    self_geom_mb: float = 2.0
+    self_pot_d0: float = 0.015
+    self_pot_kp: float = 0.1
+    self_pot_mp: float = 2.0
+    # floor barrier (ground plane)
+    floor_geom_d0: float = 0.03
+    floor_geom_kb: float = 1.0
+    floor_geom_mb: float = 2.0
+    floor_pot_d0: float = 0.015
+    floor_pot_kp: float = 0.5
+    floor_pot_mp: float = 4.0
+    # integrator safety caps (a real servo enforces these; they bound the per-step jump so a fast
+    # obstacle drag can't fling the arm to NaN) + the draggable obstacle's radius (m)
+    qdd_max: float = 50.0
+    qd_max: float = 4.0
+    obstacle_radius: float = OBSTACLE_RADIUS
 
 
 def build_model():
@@ -107,32 +129,107 @@ def _controller():
           f"{len(sph)} collision spheres  (tune with: uv run --group viz python demos/tune_spheres.py)")
     pairs = nonadjacent_pairs(sph, prov)              # non-adjacent link pairs for self-collision
     floor_pt, floor_n = (0.0, 0.0, FLOOR_Z), (0.0, 0.0, 1.0)
+    # Build every leaf with a CALLABLE gain that reads params.gains.<name>, so a slider retunes it
+    # live (traced input -> no recompile). g("x") closes over its own name (a function arg, no
+    # late-binding bug). With a fixed Gains() in params this is identical to the old baked constants.
+    g = lambda name: (lambda p: getattr(p.gains, name))
     fab = GeometricFabric(
-        geometries=[arm_obstacle_geometry(prov, sph, None, OBSTACLE_RADIUS, d0=OBST_GEOM_D0),
-                    self_collision_geometry(prov, sph, pairs, d0=SELF_GEOM_D0),
+        geometries=[arm_obstacle_geometry(prov, sph, None, g("obstacle_radius"),
+                                          k_b=g("obst_geom_kb"), m_b=g("obst_geom_mb"), d0=g("obst_geom_d0")),
+                    self_collision_geometry(prov, sph, pairs,
+                                            k_b=g("self_geom_kb"), m_b=g("self_geom_mb"), d0=g("self_geom_d0")),
                     joint_limit_geometry(prov),
-                    arm_plane_geometry(prov, sph, floor_pt, floor_n, d0=FLOOR_GEOM_D0)],
-        forcing=[pose_attractor(prov, k=POSE_K, b=POSE_B, f_max=POSE_FMAX),
-                 posture(nq, k=POSTURE_K, b=POSTURE_B, weight=POSTURE_W),
-                 arm_obstacle_potential(prov, sph, None, OBSTACLE_RADIUS, d0=OBST_POT_D0),
-                 self_collision_potential(prov, sph, pairs, d0=SELF_POT_D0),
-                 arm_plane_potential(prov, sph, floor_pt, floor_n, d0=FLOOR_POT_D0),
+                    arm_plane_geometry(prov, sph, floor_pt, floor_n,
+                                       k_b=g("floor_geom_kb"), m_b=g("floor_geom_mb"), d0=g("floor_geom_d0"))],
+        forcing=[pose_attractor(prov, k=g("pose_k"), b=g("pose_b"), m=g("pose_m"), f_max=g("pose_fmax")),
+                 posture(nq, k=g("posture_k"), b=g("posture_b"), weight=g("posture_w")),
+                 arm_obstacle_potential(prov, sph, None, g("obstacle_radius"),
+                                        k_p=g("obst_pot_kp"), m_p=g("obst_pot_mp"), d0=g("obst_pot_d0")),
+                 self_collision_potential(prov, sph, pairs,
+                                          k_p=g("self_pot_kp"), m_p=g("self_pot_mp"), d0=g("self_pot_d0")),
+                 arm_plane_potential(prov, sph, floor_pt, floor_n,
+                                     k_p=g("floor_pot_kp"), m_p=g("floor_pot_mp"), d0=g("floor_pot_d0")),
                  joint_limit_potential(prov)],
-        damping=[config_damping(nq, b=CFG_DAMP)],
+        damping=[config_damping(nq, b=g("cfg_damp"))],
         energy=fixed_metric_energy(nq, jnp.float32))
 
     @jax.jit
     def advance(q, qd, params):  # SUB semi-implicit Euler steps, one dispatch per render
+        qdd_max, qd_max = params.gains.qdd_max, params.gains.qd_max   # caps are live too (traced)
         def body(c, _):
             q, qd = c
-            qdd = jnp.clip(fab.policy(q, qd, params), -QDD_MAX, QDD_MAX)   # bound reactive accel
-            qd = jnp.clip(qd + DT * qdd, -QD_MAX, QD_MAX)                  # ...and velocity -> no fly-away
+            qdd = jnp.clip(fab.policy(q, qd, params), -qdd_max, qdd_max)   # bound reactive accel
+            qd = jnp.clip(qd + DT * qdd, -qd_max, qd_max)                  # ...and velocity -> no fly-away
             q = q + DT * qd
             return (q, qd), None
         (q, qd), _ = jax.lax.scan(body, (q, qd), None, length=SUB)
         return q, qd
 
     return prov, advance, sph
+
+
+# --- live tuning panel: an optional viser web UI (same stack as the sphere tuner). Each (field, label,
+#     min, max, step); falls back to a fixed Gains() if viser is absent so the plain run stays lean. ---
+_GUI = [
+    ("Attractor", [("pose_k", "k stiffness", 1.0, 300.0, 1.0), ("pose_b", "b damping", 0.0, 60.0, 0.5),
+                   ("pose_m", "m priority", 1.0, 200.0, 1.0), ("pose_fmax", "f_max accel cap", 1.0, 60.0, 0.5)]),
+    ("Posture / damping", [("posture_w", "posture weight", 0.0, 20.0, 0.1), ("posture_k", "posture k", 0.0, 20.0, 0.1),
+                           ("posture_b", "posture b", 0.0, 20.0, 0.05), ("cfg_damp", "config damping b", 0.0, 20.0, 0.1)]),
+    ("Obstacle barrier", [("obst_geom_d0", "geom d0 (m)", 0.005, 0.30, 0.005), ("obst_geom_kb", "geom k_b", 0.0, 5.0, 0.05),
+                          ("obst_geom_mb", "geom m_b", 0.0, 10.0, 0.1), ("obst_pot_d0", "wall d0 (m)", 0.005, 0.20, 0.005),
+                          ("obst_pot_kp", "wall k_p", 0.0, 5.0, 0.05), ("obst_pot_mp", "wall m_p", 0.0, 10.0, 0.1)]),
+    ("Self-collision barrier", [("self_geom_d0", "geom d0 (m)", 0.005, 0.20, 0.005), ("self_geom_kb", "geom k_b", 0.0, 5.0, 0.05),
+                                ("self_geom_mb", "geom m_b", 0.0, 10.0, 0.1), ("self_pot_d0", "wall d0 (m)", 0.005, 0.15, 0.005),
+                                ("self_pot_kp", "wall k_p", 0.0, 5.0, 0.05), ("self_pot_mp", "wall m_p", 0.0, 10.0, 0.1)]),
+    ("Floor barrier", [("floor_geom_d0", "geom d0 (m)", 0.005, 0.30, 0.005), ("floor_geom_kb", "geom k_b", 0.0, 5.0, 0.05),
+                       ("floor_geom_mb", "geom m_b", 0.0, 10.0, 0.1), ("floor_pot_d0", "wall d0 (m)", 0.005, 0.20, 0.005),
+                       ("floor_pot_kp", "wall k_p", 0.0, 5.0, 0.05), ("floor_pot_mp", "wall m_p", 0.0, 10.0, 0.1)]),
+    ("Integrator / obstacle", [("qdd_max", "QDD_MAX rad/s²", 5.0, 500.0, 5.0), ("qd_max", "QD_MAX rad/s", 0.5, 20.0, 0.5),
+                               ("obstacle_radius", "obstacle radius (m)", 0.02, 0.20, 0.005)]),
+]
+
+
+class _TunePanel:
+    """viser slider panel that emits a live :class:`Gains` each step + shows tracking/clearance readouts."""
+
+    def __init__(self, model, obs_geom_id):
+        import viser
+        self.model, self.obs_geom_id = model, obs_geom_id
+        self.server = viser.ViserServer()
+        self.server.gui.add_markdown("**Live fabric tuning** — drag a slider; it takes effect next frame (no recompile).")
+        d = Gains()._asdict()
+        self.sl = {}
+        for folder, items in _GUI:
+            with self.server.gui.add_folder(folder):
+                for name, label, lo, hi, step in items:
+                    self.sl[name] = self.server.gui.add_slider(label, min=lo, max=hi, step=step,
+                                                               initial_value=float(d[name]))
+        with self.server.gui.add_folder("Readouts"):
+            self.readout = self.server.gui.add_markdown("…")
+        rb = self.server.gui.add_button("reset to defaults")
+
+        @rb.on_click
+        def _(_):
+            for name, v in Gains()._asdict().items():
+                if name in self.sl:
+                    self.sl[name].value = float(v)
+
+    def gains(self):
+        gv = Gains(**{name: jnp.float32(s.value) for name, s in self.sl.items()})
+        self.model.geom_size[self.obs_geom_id, 0] = float(gv.obstacle_radius)   # resize the red ball to match
+        return gv
+
+    def set_readout(self, text):
+        self.readout.content = text
+
+
+def _make_panel(model, obs_geom_id):
+    try:
+        return _TunePanel(model, obs_geom_id)
+    except Exception as e:                                     # viser not installed / failed to start
+        print(f"[tune] live panel unavailable ({type(e).__name__}: {e}); running with fixed Gains(). "
+              f"For sliders: uv run --group viz mjpython demos/interactive_track.py")
+        return None
 
 
 def main():
@@ -142,8 +239,11 @@ def main():
     prov, advance, sph = _controller()
     nq = prov.nq
     centers_fn = jax.jit(_centers(prov, jnp.asarray(sph.link), jnp.asarray(sph.local)))
+    pairs = nonadjacent_pairs(sph, prov)                      # for the live self-collision readout
+    rsum = sph.radius[pairs[:, 0]] + sph.radius[pairs[:, 1]]
     sph_rgba = np.array([0.2, 0.6, 1.0, 0.35], np.float32)   # translucent blue collision spheres
     eye = np.eye(3).flatten()
+    obs_geom_id = int(model.body_geomadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")])
 
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)               # "home"
@@ -154,17 +254,22 @@ def main():
     data.mocap_quat[tgt_id] = np.asarray(prov.site_rot(q))
     data.mocap_pos[obs_id] = np.asarray(OBSTACLE_CENTER)
 
+    panel = _make_panel(model, obs_geom_id)                   # viser sliders (None if viz not installed)
     print(__doc__)
     print(">>> double-click the GREEN target or RED obstacle, then Ctrl + right-drag (move) "
           "/ Ctrl + left-drag (rotate the target) <<<")
-    print(">>> translucent blue = the arm's collision spheres (whole-arm + self-collision avoidance) <<<\n")
+    print(">>> translucent blue = the arm's collision spheres (whole-arm + self-collision avoidance) <<<")
+    print(">>> open the viser URL above to tune fabric gains LIVE (no recompile) <<<\n" if panel else "")
     rate = RateLimiter(frequency=1.0 / (SUB * DT), warn=False)   # cap the loop to 1/(SUB*DT) = 100 Hz
+    frame = 0
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
+            gains = panel.gains() if panel else Gains()       # live slider values (or the fixed defaults)
+            obs = np.asarray(data.mocap_pos[obs_id])
             params = FabricParams(target=jnp.asarray(data.mocap_pos[tgt_id], jnp.float32),
                                   q_default=q_home,
                                   target_quat=jnp.asarray(data.mocap_quat[tgt_id], jnp.float32),
-                                  obstacle_center=jnp.asarray(data.mocap_pos[obs_id], jnp.float32))
+                                  obstacle_center=jnp.asarray(obs, jnp.float32), gains=gains)
             q, qd = advance(q, qd, params)
             data.qpos[:nq] = np.asarray(q)
             mujoco.mj_forward(model, data)
@@ -175,6 +280,15 @@ def main():
                                     np.array([sph.radius[i], 0.0, 0.0]), c[i].astype(np.float64), eye, sph_rgba)
                 viewer.user_scn.ngeom += 1
             viewer.sync()
+            if panel and frame % 8 == 0:                      # ~12 Hz readouts (cheap numpy on the centers)
+                ee = np.asarray(prov.site_pos(q))
+                pe = float(np.linalg.norm(ee - np.asarray(data.mocap_pos[tgt_id]))) * 1e3
+                oc = float((np.linalg.norm(c - obs, axis=1) - (sph.radius + float(gains.obstacle_radius))).min()) * 1e3
+                fc = float((c[:, 2] - sph.radius).min()) * 1e3
+                sg = float((np.linalg.norm(c[pairs[:, 0]] - c[pairs[:, 1]], axis=1) - rsum).min()) * 1e3
+                panel.set_readout(f"EE err **{pe:.1f} mm** · obstacle **{oc:+.0f} mm** · floor **{fc:+.0f} mm** "
+                                  f"· self **{sg:+.0f} mm** · speed **{float(np.linalg.norm(np.asarray(qd))):.2f}** rad/s")
+            frame += 1
             rate.sleep()                                       # hold the target rate without drift
 
 
@@ -190,7 +304,8 @@ def check():
     obs = jnp.asarray(OBSTACLE_CENTER, jnp.float32)
 
     def params(tgt):
-        return FabricParams(target=tgt, q_default=q_home, target_quat=quat_home, obstacle_center=obs)
+        return FabricParams(target=tgt, q_default=q_home, target_quat=quat_home, obstacle_center=obs,
+                            gains=Gains())
 
     # (1) target sweeps left->right through the obstacle's center: the straight line penetrates it
     q, qd = q_home, jnp.zeros(nq, jnp.float32)
@@ -251,13 +366,32 @@ def check():
     finite, qmax = True, 0.0
     for s in list(np.linspace(0.6, 0.0, 8)) + [0.0] * 8:              # rush in ~7.5 m/s, then sit on the EE
         p = FabricParams(target=tgt, q_default=q_home, target_quat=quat_home,
-                         obstacle_center=jnp.asarray([ee[0], ee[1] + s, ee[2]], jnp.float32))
+                         obstacle_center=jnp.asarray([ee[0], ee[1] + s, ee[2]], jnp.float32), gains=Gains())
         q, qd = advance(q, qd, p)
         finite = finite and bool(jnp.all(jnp.isfinite(q)))
         qmax = max(qmax, float(jnp.max(jnp.abs(q))))
     print(f"[stability] obstacle slammed into the arm: q finite={finite}, max|q|={qmax:.1f} rad "
           f"({'STABLE' if finite and qmax < 10 else 'BLEW UP'})")
     assert finite and qmax < 10.0, "fast obstacle drag blew up the integrator"
+
+    # (5) live tuning is a *traced* input change, not a recompile: retuning pose_k mid-run keeps the
+    #     jit cache fixed and still takes effect (a stiffer k tracks a step target faster).
+    tgt5 = jnp.asarray([ee[0] + 0.15, ee[1], ee[2]], jnp.float32)
+    n_cache = advance._cache_size()
+
+    def _track(pose_k):
+        qq, qv = q_home, jnp.zeros(nq, jnp.float32)
+        p = FabricParams(target=tgt5, q_default=q_home, target_quat=quat_home, obstacle_center=obs,
+                         gains=Gains(pose_k=pose_k))
+        for _ in range(40):
+            qq, qv = advance(qq, qv, p)
+        return float(np.linalg.norm(np.asarray(prov.site_pos(qq)) - np.asarray(tgt5)))
+
+    err_soft, err_stiff = _track(6.0), _track(120.0)
+    assert advance._cache_size() == n_cache, "a live gain change forced a recompile"
+    assert err_stiff < err_soft, "stiffer pose_k did not track faster"
+    print(f"[live-tuning] gains are traced (no recompile; jit cache={n_cache}); stiffer k tracks faster "
+          f"({err_soft*1e3:.0f} -> {err_stiff*1e3:.0f} mm EE error)")
 
 
 if __name__ == "__main__":

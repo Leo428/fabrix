@@ -31,7 +31,7 @@ cd mujoco_menagerie && git sparse-checkout set kinova_gen3 robotiq_2f85 && cd ..
 uv run pytest -q                          # correctness, convergence, smoothness, latency, invariants
 uv run python demos/attractor_reach.py    # M1 reach demo    -> demos/attractor_reach.png
 uv run python demos/obstacle_reach.py     # M2 reach + avoid -> demos/obstacle_reach.png
-uv run mjpython demos/interactive_track.py  # M3 live viewer: drag/rotate a 6-DOF target (macOS)
+uv run --group viz mjpython demos/interactive_track.py  # M3 live viewer (macOS): drag a 6-DOF target + a viser panel to tune gains live
 uv run --group viz python demos/tune_spheres.py  # tune collision spheres in a browser (viser UI)
 ```
 
@@ -47,7 +47,9 @@ step-to-step `q̈` ≈ 0.31) at **~66 µs/step**.
 **M3 (full SE(3) pose):** tracks position **and** orientation — reach error **0.82 mm** / **0.019°**,
 C2-smooth, at **~88 µs/step** (float32). The error `Log(T*⁻¹T) ∈ se(3)` and its curvature term come
 straight from autodiff through `jaxlie`. `demos/interactive_track.py` is a live viewer: drag and
-rotate a 6-DOF target and watch the arm track it while avoiding an obstacle.
+rotate a 6-DOF target and watch the arm track it while avoiding an obstacle; with the `viz` group an
+optional **viser panel retunes every fabric gain in real time** (gains ride in the traced params, so
+a slider change takes effect next frame with no recompile).
 
 **Whole-arm & self-collision (collision spheres):** spheres auto-placed on every link give the *whole*
 arm — not just the EE — obstacle/floor avoidance, plus a self-collision barrier between non-adjacent
