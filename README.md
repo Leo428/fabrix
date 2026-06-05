@@ -32,6 +32,7 @@ uv run pytest -q                          # correctness, convergence, smoothness
 uv run python demos/attractor_reach.py    # M1 reach demo    -> demos/attractor_reach.png
 uv run python demos/obstacle_reach.py     # M2 reach + avoid -> demos/obstacle_reach.png
 uv run mjpython demos/interactive_track.py  # M3 live viewer: drag/rotate a 6-DOF target (macOS)
+uv run --group viz python demos/tune_spheres.py  # tune collision spheres in a browser (viser UI)
 ```
 
 ## Results
@@ -54,11 +55,17 @@ links. All pairs run as one **batched, shared-FK** barrier (one FK to every link
 pairwise SDFs, one summed pullback), so the full fabric (84 self-pairs + 32 environment) is **~124
 µs/step** — ~15 µs over the base. Bit-identical to per-pair leaves but flat in compile time.
 
+Spheres are **auto-placed** from the kinematics, then **hand-tuned** if a link is over/under-covered:
+`demos/tune_spheres.py` is a **viser web UI** (browser — works headless / over SSH) to drag each
+sphere's radius and position and scrub the pose for coverage, exporting `demos/spheres_tuned.py`, which
+the demos load automatically (auto until that file exists). `viser` is an optional `viz` dependency, so
+the core install stays lean.
+
 ## Layout
 
 | path | contents |
 |---|---|
-| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`, `site_pose`, `body_poses`), `maps` (position / SDF / SE(3) pose), `leaves` (attractor, `pose_attractor`, posture, damping), `energy` (Finsler), `geometry` (energization + barriers), `collision` (sphere model + whole-arm/self-collision), `fabric`, `integrate` |
+| `fabrix/` | library: `spec` (spec algebra), `diff` (autodiff `J` + `J̇q̇`), `kinematics` (`CustomFK`, `site_pose`, `body_poses`), `maps` (position / SDF / SE(3) pose), `leaves` (attractor, `pose_attractor`, posture, damping), `energy` (Finsler), `geometry` (energization + barriers), `collision` (sphere model + tuning + whole-arm/self-collision), `fabric`, `integrate` |
 | `demos/` | runnable demos |
 | `tests/` | pytest suite |
 | `experiments/` | de-risking scratch (autodiff-FK correctness + latency studies) |

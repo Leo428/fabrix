@@ -158,26 +158,32 @@ Driving `demos/interactive_track.py` surfaced these. With M1→M3 complete these
     and links (not just the EE) it needs the whole-arm collision spheres below.
 - **Self-collision / whole-arm obstacle avoidance** — ✅ **DONE (2026-06)**. Collision-sphere proxies
   (`fabrix/collision.py`): `auto_arm_spheres` places spheres along each link's bone (radius from the
-  collision-mesh width; hand-tunable via `SphereModel` / `SphereModel.from_dict`), `nonadjacent_pairs`
+  collision-mesh width; per-link `radius_scale`, or full hand-tuning — see the pipeline below), `nonadjacent_pairs`
   selects the self-collision pairs (excludes same-link + parent-child). A **batched / shared-FK**
   barrier — one FK to all link frames (`CustomFK.body_poses`, **#8**), vectorized pairwise/region SDFs,
   one summed pullback (generalized `sdf_barrier_*`, **#1**) — drives `self_collision_{geometry,potential}`
   and the whole-arm `arm_obstacle_*` / `arm_plane_*` (obstacle & floor now guard *every* sphere, not
   just the EE). Geometry deflects, potential is the hard wall (the M2 division of labour).
-  - **Validated** (`tests/test_collision.py`, 7): `body_poses` vs MuJoCo 1e-9; self-collision `J`/`J̇q̇`
+  - **Validated** (`tests/test_collision.py`, 11): `body_poses` vs MuJoCo 1e-9; self-collision `J`/`J̇q̇`
     vs finite-diff 1e-10; the batched leaf is **bit-identical** to ``k`` separate leaves (`max|Δ|<1e-9`,
     the #1 claim); driven into a −73 mm self-colliding fold it stays clear, and a forearm rammed −106 mm
     through an obstacle deflects to **+55 mm** while the EE still reaches (2 mm). Full collision fabric
     (k=84 self + 16 obstacle + 16 floor) **~124 µs/step** — only ~15 µs over the base fabric (the batched
     payoff). `--check`: obstacle +53 mm, floor +143 mm, self-collision +29 mm, all CLEAR; the demo draws
     the spheres translucent-blue.
+  - **Tuning pipeline (auto → tune → reload)** — ✅ done. `auto_arm_spheres(radius_scale={…})` /
+    `SphereModel.scaled` shrink over-covering links in one line; `SphereModel.to_dict`↔`from_dict`
+    round-trips a committable literal; **`demos/tune_spheres.py`** is a **viser web UI** (optional `viz`
+    dep) — select a sphere, drag its radius / position gizmo, scrub the pose to check coverage, export
+    to `demos/spheres_tuned.py`, which **`load_spheres`** auto-loads into the demos (auto until that file
+    exists). Browser-based → no local OpenGL / `mjpython`, works headless / over SSH.
   - **#1 batched `sdf_barrier`** + **#8 per-link FK** — ✅ done (the two foundations above).
   - Still deferred to real-arm dimensions: **#2** hard joint no-go limits, **#3** keep-out volume
     (the whole-arm sphere machinery #3 needs is now in place — add a keep-out plane/box barrier over the spheres).
 
 ### Performance profile (2026-06-04, CPU float32, single arm)
-Profiled the real 10-leaf demo fabric (throwaway harness `/tmp/profile_fabrix.py`; promote to
-`bench/` if a permanent guard is wanted).
+Profiled the real 10-leaf demo fabric (permanent harness `bench/profile_fabrix.py` —
+`uv run python bench/profile_fabrix.py`).
 - **~110–123 µs / control step** (single dispatch, distinct inputs) — ~8× under the 1 kHz budget.
   Hygiene clean: params traced (6 values → 1 compile, no recompiles), q̈ + pose-error stay float32,
   output finite. No anti-patterns.
@@ -209,15 +215,17 @@ pure-functional + vmap-clean anyway — free hygiene.)
 ## Run
 
 ```bash
-uv run pytest -q                          # 35 tests (11 M1 + 11 M2 + 6 M3 + 7 collision)
+uv run pytest -q                          # 39 tests (11 M1 + 11 M2 + 6 M3 + 11 collision)
 uv run python demos/attractor_reach.py    # M1 -> demos/attractor_reach.png
 uv run python demos/obstacle_reach.py     # M2 -> demos/obstacle_reach.png
 uv run mjpython demos/interactive_track.py        # M3 6-DOF pose + whole-arm/self-collision (macOS; --check headless)
+uv run --group viz python demos/tune_spheres.py   # tune collision spheres in a viser web UI (browser; optional 'viz' dep)
 ```
 
 ## Environment / facts
 
-- uv project (Python 3.12): jax, jax-dataclasses, jaxlie, matplotlib, mujoco; pytest (dev).
+- uv project (Python 3.12): jax, jax-dataclasses, jaxlie, loop-rate-limiters, matplotlib, mujoco;
+  pytest (dev); viser (optional `viz` group — only `demos/tune_spheres.py`; core install stays lean).
   `pyproject.toml` has `[tool.pytest.ini_options] pythonpath=["."]`.
 - Models: MuJoCo Menagerie sparse-checkout (`kinova_gen3`, `robotiq_2f85`) — not vendored.
 - Gen3 EE site is `pinch_site`; arm is 7 hinge joints (`nq=nv=7`).
