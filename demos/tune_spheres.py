@@ -3,7 +3,7 @@
 Renders the Gen3's links (their visual meshes) with the collision spheres overlaid, and lets you
 reshape the spheres in the browser, then export a hand-tuned model:
 
-  * **select** a sphere from the dropdown or by clicking it (selected = yellow);
+  * **select** a sphere from the dropdown or by clicking it (selected = yellow, its link tinted teal);
   * drag the **radius** slider to resize it, or the 3-axis **gizmo** to move it (in its link frame);
   * move precisely with the **x / y / z** inputs or the **nudge** buttons (viser has no global hotkeys);
   * **add / duplicate / delete** spheres on any link;
@@ -42,6 +42,7 @@ GEN3 = "mujoco_menagerie/kinova_gen3/gen3.xml"
 TUNED = pathlib.Path(__file__).with_name("spheres_tuned.py")   # the export target / resume source
 
 C_MESH = (170, 172, 180)        # link meshes: neutral gray
+C_LINK = (80, 200, 150)         # selected sphere's link mesh: teal highlight (shows where it attaches)
 C_BLUE = (60, 140, 255)         # spheres: translucent blue
 C_SEL = (255, 205, 40)          # selected sphere: yellow
 OP_SPH, OP_SEL = 0.30, 0.6
@@ -122,15 +123,18 @@ class Tuner:
         for i in range(len(self.link)):
             self._draw_sphere(i)
         self._move_gizmo(self.sel)
+        self._highlight_link(int(self.link[self.sel]))        # tint the initially-selected sphere's link
 
     # ---------------------------------------------------------------- scene
     def _build_scene(self):
         s = self.server.scene
         s.add_grid("/grid", width=2.0, height=2.0, cell_size=0.1)
         self.frames = {b: s.add_frame(f"/body{b}", show_axes=False) for b in range(1, self.m.nbody)}
+        self.mesh_h = {}                                       # body id -> [mesh handles] (link highlight)
         for bid, g, verts, faces, gp, gq in _visual_meshes(self.m):
-            s.add_mesh_simple(f"/body{bid}/mesh{g}", verts, faces, color=C_MESH,
-                              position=gp, wxyz=gq, opacity=0.9)
+            h = s.add_mesh_simple(f"/body{bid}/mesh{g}", verts, faces, color=C_MESH,
+                                  position=gp, wxyz=gq, opacity=0.9)
+            self.mesh_h.setdefault(bid, []).append(h)
 
     def _set_pose(self, q):
         P, Q = self._wf(jnp.asarray(q, jnp.float32))          # one FK to every body frame
@@ -175,7 +179,7 @@ class Tuner:
     # ---------------------------------------------------------------- gui
     def _build_gui(self):
         g = self.server.gui
-        g.add_markdown("**Collision-sphere tuner** — select a sphere, resize / move it, scrub the pose, export.")
+        g.add_markdown("**Collision-sphere tuner** — select a sphere (its link tints teal), resize / move it, scrub the pose, export.")
 
         with g.add_folder("Pose"):
             self._jsliders = []
@@ -298,10 +302,19 @@ class Tuner:
         self._draw_sphere(old)                                # recolor the previously-selected one
         self._refresh_selected()
 
+    def _highlight_link(self, bid):
+        """Tint the selected sphere's link mesh (so it's obvious which link the sphere rides on);
+        every other link resets to neutral gray. A link may carry several mesh geoms."""
+        for b, handles in self.mesh_h.items():
+            col = C_LINK if b == bid else C_MESH
+            for h in handles:
+                h.color = col
+
     def _refresh_selected(self):
         i = self.sel
         self._draw_sphere(i)
         self._move_gizmo(i)
+        self._highlight_link(int(self.link[i]))              # tint the link this sphere attaches to
         self._sync = True                                     # reflect state in widgets w/o re-firing
         self.rad.value = float(self.radius[i] * 1e3)
         self.dd.value = self._opts()[i]
@@ -378,6 +391,17 @@ def main(check=False):
     tuner = Tuner(server)
     if check:
         n0 = len(tuner.link)                                  # exercise the mutation logic headlessly
+        # link highlight: the selected sphere's link mesh is teal, every other link stays gray,
+        # and the tint follows the selection.
+        _col = lambda h: tuple(int(c) for c in h.color)
+        def _assert_highlight(bid):
+            assert all(_col(h) == C_LINK for h in tuner.mesh_h[bid]), "selected link not highlighted"
+            assert all(_col(h) == C_MESH for b, hs in tuner.mesh_h.items() if b != bid
+                       for h in hs), "a non-selected link is highlighted"
+        _assert_highlight(int(tuner.link[tuner.sel]))         # initial selection highlighted on load
+        j = next(i for i in range(len(tuner.link)) if int(tuner.link[i]) != int(tuner.link[tuner.sel]))
+        tuner._select(j); _assert_highlight(int(tuner.link[j]))    # highlight moves with selection
+        tuner._select(0)                                      # restore default selection for the rest
         tuner._add("forearm_link")
         assert len(tuner.link) == n0 + 1 and tuner.names[-1] == "forearm_link" and tuner.sel == n0
         tuner._add(tuner.names[tuner.sel], tuner.local[tuner.sel].copy(), float(tuner.radius[tuner.sel]))
@@ -387,7 +411,7 @@ def main(check=False):
         assert len(tuner.link) == n0 and len(tuner.names) == n0
         assert len(tuner.dd.options) == n0 and tuner.local.shape == (n0, 3)
         print(f"[check] tuner OK — {n0} spheres, {len(_visual_meshes(tuner.m))} link meshes, "
-              f"{'tuned' if tuner.tuned else 'auto'} model; add/duplicate/nudge/delete exercised")
+              f"{'tuned' if tuner.tuned else 'auto'} model; add/duplicate/nudge/delete + link-highlight exercised")
         server.stop()
         return
     print("\n>>> open the URL above: select a sphere, drag radius / gizmo, scrub the pose, then Export <<<")
