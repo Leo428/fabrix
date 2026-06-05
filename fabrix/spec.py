@@ -66,3 +66,15 @@ def resolve(spec: Spec, reg: float = 1e-6) -> jnp.ndarray:
     n = spec.M.shape[0]
     M = spec.M + reg * jnp.eye(n, dtype=spec.M.dtype)
     return -jsl.cho_solve(jsl.cho_factor(M), spec.f)
+
+
+def dynamic_gain(g, params):
+    """Resolve a leaf gain that is *either* a baked constant *or* a callable ``params -> value``.
+
+    A plain number (or ``None``) is used as-is: the gain is fixed at construction, exactly as in
+    M1–M3. A callable is evaluated against the traced ``params`` each step (e.g.
+    ``lambda p: p.gains.pose_k``), so the value can be retuned live — from a slider, say — with **no
+    recompile**, the same mechanism that lets ``params.target`` move every frame. Constants are
+    untouched (``callable(3.0)`` is ``False``), so every existing leaf keeps its behavior.
+    """
+    return g(params) if callable(g) else g

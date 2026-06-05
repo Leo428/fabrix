@@ -25,7 +25,7 @@ import numpy as np
 
 from fabrix.diff import value_jac_curv
 from fabrix.maps import plane_sdf_map, sphere_sdf_map
-from fabrix.spec import Spec
+from fabrix.spec import Spec, dynamic_gain
 
 
 def energize(a_g, v, M_e, f_e, eps: float = 1e-8):
@@ -170,12 +170,12 @@ def sdf_barrier_geometry(dist, k_b: float = 1.0, power: float = 2.0, m_b: float 
     def leaf(q, qd, params):
         phi = lambda qq: dist(qq, params)                       # noqa: E731  (q-only for autodiff)
         x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(k,) J:(k,nq) Jdq:(k,)
-        d = jnp.clip(x - margin, eps, None)                     # (k,)
+        d = jnp.clip(x - dynamic_gain(margin, params), eps, None)   # (k,)
         dd = J @ qd                                             # (k,) d/dt of each distance
-        a_g = _barrier_accel(d, dd, k_b, power)                 # (k,) accel away from each surface
-        m = _barrier_metric(d, dd, m_b)                         # (k,) per-surface priority weight
+        a_g = _barrier_accel(d, dd, dynamic_gain(k_b, params), power)   # (k,) accel away from surfaces
+        m = _barrier_metric(d, dd, dynamic_gain(m_b, params))  # (k,) per-surface priority weight
         if d0 is not None:
-            m = m * _band(d, d0)                                # fade priority out beyond d0
+            m = m * _band(d, dynamic_gain(d0, params))          # fade priority out beyond d0
         return _pullback_diag(J, Jdq, m, -m * a_g)              # = -M a_des, batched over k
 
     return leaf
@@ -267,9 +267,10 @@ def sdf_barrier_potential(dist, k_p: float = 0.5, d0: float = 0.2, m_p: float = 
     def leaf(q, qd, params):
         phi = lambda qq: dist(qq, params)                       # noqa: E731  (q-only for autodiff)
         x, J, Jdq = value_jac_curv(phi, q, qd)                  # x:(k,) J:(k,nq) Jdq:(k,)
-        d = jnp.clip(x - margin, eps, None)                     # (k,)
-        f = _barrier_potential_grad(d, k_p, d0)                 # (k,) diverging task-space forces
-        m = m_p * _band(d, d0)                                  # (k,) smooth standoff envelope
+        d = jnp.clip(x - dynamic_gain(margin, params), eps, None)   # (k,)
+        d0_ = dynamic_gain(d0, params)
+        f = _barrier_potential_grad(d, dynamic_gain(k_p, params), d0_)  # (k,) diverging task forces
+        m = dynamic_gain(m_p, params) * _band(d, d0_)           # (k,) smooth standoff envelope
         return _pullback_diag(J, Jdq, m, f)                     # batched over k
 
     return leaf

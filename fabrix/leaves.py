@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 from fabrix.diff import value_jac_curv
 from fabrix.maps import se3_pose_error_map, site_position_map
-from fabrix.spec import Spec, pullback
+from fabrix.spec import Spec, dynamic_gain, pullback
 
 
 def _restoring(e, k: float, f_max: Optional[float], eps: float = 1e-3):
@@ -51,8 +51,9 @@ def attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
     def leaf(q, qd, params):
         x, J, Jdq = value_jac_curv(phi, q, qd)
         xd = J @ qd
-        M = m * jnp.eye(3, dtype=x.dtype)
-        f = m * (_restoring(x - params.target, k, f_max) + b * xd)  # = -M @ a_des
+        k_, b_, m_, fm_ = (dynamic_gain(g, params) for g in (k, b, m, f_max))
+        M = m_ * jnp.eye(3, dtype=x.dtype)
+        f = m_ * (_restoring(x - params.target, k_, fm_) + b_ * xd)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
     return leaf
@@ -74,8 +75,9 @@ def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
         phi = se3_pose_error_map(provider, params.target, params.target_quat)
         e, J, Jdq = value_jac_curv(phi, q, qd)
         ed = J @ qd
-        M = m * jnp.eye(6, dtype=e.dtype)
-        f = m * (_restoring(e, k, f_max) + b * ed)  # = -M @ a_des
+        k_, b_, m_, fm_ = (dynamic_gain(g, params) for g in (k, b, m, f_max))
+        M = m_ * jnp.eye(6, dtype=e.dtype)
+        f = m_ * (_restoring(e, k_, fm_) + b_ * ed)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
     return leaf
@@ -95,13 +97,13 @@ def posture(nq: int, k=1.0, b: float = 2.0, weight=0.5):
     (or low-orientation-weight) task frees 4 DOF and posture becomes far more effective. Hard
     "never enter this pose" guarantees come from joint-limit barriers, not posture.
     """
-    w = jnp.asarray(weight)
-    kk = jnp.asarray(k)
-
     def leaf(q, qd, params):
+        w = jnp.asarray(dynamic_gain(weight, params))
+        kk = jnp.asarray(dynamic_gain(k, params))
+        b_ = dynamic_gain(b, params)
         wv = jnp.broadcast_to(w, (nq,)).astype(q.dtype)
         M = jnp.diag(wv)
-        f = wv * (kk * (q - params.q_default) + b * qd)  # = -M @ a_des (per-joint weight cancels in a_des)
+        f = wv * (kk * (q - params.q_default) + b_ * qd)  # = -M @ a_des (per-joint weight cancels in a_des)
         return Spec(M, f)
 
     return leaf
@@ -111,8 +113,9 @@ def config_damping(nq: int, b: float = 2.0, mass: float = 1.0):
     """Pure joint-space damping: global dissipation + a full-rank metric contribution."""
 
     def leaf(q, qd, params):
-        M = mass * jnp.eye(nq, dtype=q.dtype)
-        f = mass * b * qd  # = -M @ (-b q̇)  → isolated accel -b·q̇
+        mass_, b_ = dynamic_gain(mass, params), dynamic_gain(b, params)
+        M = mass_ * jnp.eye(nq, dtype=q.dtype)
+        f = mass_ * b_ * qd  # = -M @ (-b q̇)  → isolated accel -b·q̇
         return Spec(M, f)
 
     return leaf

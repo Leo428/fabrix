@@ -32,6 +32,7 @@ import numpy as np
 
 from fabrix.geometry import sdf_barrier_geometry, sdf_barrier_potential
 from fabrix.kinematics import _qrot
+from fabrix.spec import dynamic_gain
 
 _SOFT = 1e-6  # softens the pairwise norm so its gradient stays finite if two centers coincide
 
@@ -258,7 +259,8 @@ def arm_obstacle_geometry(provider, spheres: SphereModel, center, radius: float,
         c = centers(q)
         o = params.obstacle_center if cfix is None else cfix
         diff = c - o
-        return (jnp.sqrt(jnp.sum(diff * diff, axis=1) + _SOFT * _SOFT) - (rad + radius)).astype(q.dtype)  # (Ns,)
+        return (jnp.sqrt(jnp.sum(diff * diff, axis=1) + _SOFT * _SOFT)
+                - (rad + dynamic_gain(radius, params))).astype(q.dtype)  # (Ns,)
 
     return sdf_barrier_geometry(dist, k_b=k_b, power=power, m_b=m_b, d0=d0, margin=margin, eps=eps)
 
@@ -274,7 +276,8 @@ def arm_obstacle_potential(provider, spheres: SphereModel, center, radius: float
         c = centers(q)
         o = params.obstacle_center if cfix is None else cfix
         diff = c - o
-        return (jnp.sqrt(jnp.sum(diff * diff, axis=1) + _SOFT * _SOFT) - (rad + radius)).astype(q.dtype)
+        return (jnp.sqrt(jnp.sum(diff * diff, axis=1) + _SOFT * _SOFT)
+                - (rad + dynamic_gain(radius, params))).astype(q.dtype)
 
     return sdf_barrier_potential(dist, k_p=k_p, d0=d0, m_p=m_p, margin=margin, eps=eps)
 

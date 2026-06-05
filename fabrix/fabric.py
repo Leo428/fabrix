@@ -7,6 +7,7 @@ real-time loop pays a single dispatch per tick.
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,11 @@ class FabricParams:
     # far-away default so an unset/unused obstacle leaf stays inert.
     obstacle_center: jnp.ndarray = dataclasses.field(
         default_factory=lambda: jnp.array([0.0, 0.0, 100.0]))
+    # Optional live-tuning gains: any pytree (e.g. a dataclass / NamedTuple of scalars) read by
+    # leaves built with *callable* gains (``lambda p: p.gains...``). ``None`` when gains are baked at
+    # construction (the M1–M3 default), so this stays fully backward-compatible — see
+    # :func:`fabrix.spec.dynamic_gain`.
+    gains: Any = None
 
 
 class Fabric:

@@ -22,10 +22,10 @@ from fabrix.leaves import attractor, config_damping, pose_attractor, posture
 from fabrix.maps import (
     plane_sdf_map, se3_pose_error_map, site_position_map, sphere_sdf_map,
 )
-from fabrix.spec import Spec, combine, pullback, resolve
+from fabrix.spec import Spec, combine, dynamic_gain, pullback, resolve
 
 __all__ = [
-    "Spec", "pullback", "combine", "resolve",
+    "Spec", "pullback", "combine", "resolve", "dynamic_gain",
     "value_jac_curv",
     "KinematicsProvider", "CustomFK",
     "site_position_map", "sphere_sdf_map", "plane_sdf_map", "se3_pose_error_map",
