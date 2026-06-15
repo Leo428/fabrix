@@ -35,9 +35,9 @@ from loop_rate_limiters import RateLimiter
 
 from fabrix import (CustomFK, FabricParams, GeometricFabric, arm_obstacle_geometry,
                     arm_obstacle_potential, arm_plane_geometry, arm_plane_potential,
-                    config_damping, fixed_metric_energy, joint_limit_geometry,
-                    joint_limit_potential, load_spheres, nonadjacent_pairs, pose_attractor, posture,
-                    self_collision_geometry, self_collision_potential)
+                    fixed_metric_energy, joint_limit_geometry, joint_limit_potential,
+                    joint_speed_limit, limit_accel, load_spheres, nonadjacent_pairs, pose_attractor,
+                    posture, self_collision_geometry, self_collision_potential, speed_control)
 from fabrix.collision import _centers
 
 TUNED_SPHERES = pathlib.Path(__file__).with_name("spheres_tuned.py")  # written by demos/tune_spheres.py
@@ -67,11 +67,21 @@ class Gains(NamedTuple):
     pose_b: float = 12.0
     pose_m: float = 50.0
     pose_fmax: float = 10.0
+    # distance-scaled attractor metric (D1): high near goal → dominates posture (no offset/orbit), low far.
+    # pose_m_max == pose_m ⇒ constant (legacy); raise (~150-300) to engage. m(‖e‖) switches at pose_m_offset.
+    pose_m_max: float = 50.0
+    pose_m_sharp: float = 10.0
+    pose_m_offset: float = 0.1
     # posture (nullspace → upright nominal) + global joint damping
     posture_w: float = 2.0
     posture_k: float = 2.0
     posture_b: float = 2.83
     cfg_damp: float = 2.0
+    # speed control / KE cap (D2): cfg_damp is baseline damping b; speed_beta is the overspeed boost when
+    # E=½‖q̇‖² exceeds speed_E_max (human-proximity safety). speed_beta=0 ⇒ no cap = constant config_damping.
+    speed_beta: float = 0.0
+    speed_E_max: float = 5.0     # demo: finite high cap so the slider has a range; speed_beta=0 ⇒ still off
+    speed_k_gate: float = 20.0
     # obstacle barrier (whole-arm)
     obst_geom_d0: float = 0.06
     obst_geom_kb: float = 1.0
@@ -97,6 +107,11 @@ class Gains(NamedTuple):
     # obstacle drag can't fling the arm to NaN) + the draggable obstacle's radius (m)
     qdd_max: float = 50.0
     qd_max: float = 4.0
+    # per-joint velocity-limit barrier: smoothly decelerate a joint near its qd_max bound (0 = off).
+    # (Direction-preserving accel scaling to qdd_max is always on, replacing the per-axis clip.)
+    qsl_kb: float = 0.0
+    qsl_mb: float = 0.0
+    qsl_d0: float = 0.5
     obstacle_radius: float = OBSTACLE_RADIUS
 
 
@@ -141,7 +156,8 @@ def _controller():
                     joint_limit_geometry(prov),
                     arm_plane_geometry(prov, sph, floor_pt, floor_n,
                                        k_b=g("floor_geom_kb"), m_b=g("floor_geom_mb"), d0=g("floor_geom_d0"))],
-        forcing=[pose_attractor(prov, k=g("pose_k"), b=g("pose_b"), m=g("pose_m"), f_max=g("pose_fmax")),
+        forcing=[pose_attractor(prov, k=g("pose_k"), b=g("pose_b"), m=g("pose_m"), f_max=g("pose_fmax"),
+                                m_max=g("pose_m_max"), sharp=g("pose_m_sharp"), offset=g("pose_m_offset")),
                  posture(nq, k=g("posture_k"), b=g("posture_b"), weight=g("posture_w")),
                  arm_obstacle_potential(prov, sph, None, g("obstacle_radius"),
                                         k_p=g("obst_pot_kp"), m_p=g("obst_pot_mp"), d0=g("obst_pot_d0")),
@@ -149,8 +165,10 @@ def _controller():
                                           k_p=g("self_pot_kp"), m_p=g("self_pot_mp"), d0=g("self_pot_d0")),
                  arm_plane_potential(prov, sph, floor_pt, floor_n,
                                      k_p=g("floor_pot_kp"), m_p=g("floor_pot_mp"), d0=g("floor_pot_d0")),
-                 joint_limit_potential(prov)],
-        damping=[config_damping(nq, b=g("cfg_damp"))],
+                 joint_limit_potential(prov),
+                 joint_speed_limit(nq, qd_lim=g("qd_max"), k_b=g("qsl_kb"), m_b=g("qsl_mb"), d0=g("qsl_d0"))],
+        damping=[speed_control(nq, b=g("cfg_damp"), beta_speed=g("speed_beta"),
+                               E_max=g("speed_E_max"), k_gate=g("speed_k_gate"))],
         energy=fixed_metric_energy(nq, jnp.float32))
 
     @jax.jit
@@ -158,7 +176,7 @@ def _controller():
         qdd_max, qd_max = params.gains.qdd_max, params.gains.qd_max   # caps are live too (traced)
         def body(c, _):
             q, qd = c
-            qdd = jnp.clip(fab.policy(q, qd, params), -qdd_max, qdd_max)   # bound reactive accel
+            qdd = limit_accel(fab.policy(q, qd, params), qdd_max)          # direction-preserving accel cap
             qd = jnp.clip(qd + DT * qdd, -qd_max, qd_max)                  # ...and velocity -> no fly-away
             q = q + DT * qd
             return (q, qd), None
@@ -172,9 +190,11 @@ def _controller():
 #     min, max, step); falls back to a fixed Gains() if viser is absent so the plain run stays lean. ---
 _GUI = [
     ("Attractor", [("pose_k", "k stiffness", 1.0, 300.0, 1.0), ("pose_b", "b damping", 0.0, 60.0, 0.5),
-                   ("pose_m", "m priority", 1.0, 200.0, 1.0), ("pose_fmax", "f_max accel cap", 1.0, 60.0, 0.5)]),
+                   ("pose_m", "m far (floor)", 1.0, 200.0, 1.0), ("pose_fmax", "f_max accel cap", 1.0, 60.0, 0.5),
+                   ("pose_m_max", "m near-goal (D1)", 1.0, 400.0, 1.0), ("pose_m_offset", "m switch r (m)", 0.01, 0.5, 0.01)]),
     ("Posture / damping", [("posture_w", "posture weight", 0.0, 20.0, 0.1), ("posture_k", "posture k", 0.0, 20.0, 0.1),
-                           ("posture_b", "posture b", 0.0, 20.0, 0.05), ("cfg_damp", "config damping b", 0.0, 20.0, 0.1)]),
+                           ("posture_b", "posture b", 0.0, 20.0, 0.05), ("cfg_damp", "damping b (cruise)", 0.0, 20.0, 0.1),
+                           ("speed_beta", "overspeed β (D2)", 0.0, 100.0, 1.0), ("speed_E_max", "KE cap ½‖q̇‖²", 0.05, 5.0, 0.05)]),
     ("Obstacle barrier", [("obst_geom_d0", "geom d0 (m)", 0.005, 0.30, 0.005), ("obst_geom_kb", "geom k_b", 0.0, 5.0, 0.05),
                           ("obst_geom_mb", "geom m_b", 0.0, 10.0, 0.1), ("obst_pot_d0", "wall d0 (m)", 0.005, 0.20, 0.005),
                           ("obst_pot_kp", "wall k_p", 0.0, 5.0, 0.05), ("obst_pot_mp", "wall m_p", 0.0, 10.0, 0.1)]),
@@ -185,6 +205,7 @@ _GUI = [
                        ("floor_geom_mb", "geom m_b", 0.0, 10.0, 0.1), ("floor_pot_d0", "wall d0 (m)", 0.005, 0.20, 0.005),
                        ("floor_pot_kp", "wall k_p", 0.0, 5.0, 0.05), ("floor_pot_mp", "wall m_p", 0.0, 10.0, 0.1)]),
     ("Integrator / obstacle", [("qdd_max", "QDD_MAX rad/s²", 5.0, 500.0, 5.0), ("qd_max", "QD_MAX rad/s", 0.5, 20.0, 0.5),
+                               ("qsl_kb", "vel-limit k_b", 0.0, 30.0, 0.5), ("qsl_mb", "vel-limit m_b", 0.0, 60.0, 1.0),
                                ("obstacle_radius", "obstacle radius (m)", 0.02, 0.20, 0.005)]),
 ]
 
@@ -286,8 +307,11 @@ def main():
                 oc = float((np.linalg.norm(c - obs, axis=1) - (sph.radius + float(gains.obstacle_radius))).min()) * 1e3
                 fc = float((c[:, 2] - sph.radius).min()) * 1e3
                 sg = float((np.linalg.norm(c[pairs[:, 0]] - c[pairs[:, 1]], axis=1) - rsum).min()) * 1e3
+                qd_np = np.asarray(qd)
+                spd, ke = float(np.linalg.norm(qd_np)), 0.5 * float(qd_np @ qd_np)
+                cap = f" / cap {float(gains.speed_E_max):.2f}" if float(gains.speed_beta) > 0 else ""
                 panel.set_readout(f"EE err **{pe:.1f} mm** · obstacle **{oc:+.0f} mm** · floor **{fc:+.0f} mm** "
-                                  f"· self **{sg:+.0f} mm** · speed **{float(np.linalg.norm(np.asarray(qd))):.2f}** rad/s")
+                                  f"· self **{sg:+.0f} mm** · speed **{spd:.2f}** rad/s · KE **{ke:.2f}**{cap}")
             frame += 1
             rate.sleep()                                       # hold the target rate without drift
 
@@ -392,6 +416,14 @@ def check():
     assert err_stiff < err_soft, "stiffer pose_k did not track faster"
     print(f"[live-tuning] gains are traced (no recompile; jit cache={n_cache}); stiffer k tracks faster "
           f"({err_soft*1e3:.0f} -> {err_stiff*1e3:.0f} mm EE error)")
+    # D1/D2/D-vel gains are traced too: toggling dynamic mass, the KE cap, and the velocity-limit
+    # barrier mid-run must not recompile.
+    for gn in (Gains(pose_m_max=300.0, pose_m_offset=0.08), Gains(speed_beta=60.0, speed_E_max=0.3),
+               Gains(qsl_kb=5.0, qsl_mb=20.0)):
+        advance(q_home, jnp.zeros(nq, jnp.float32),
+                FabricParams(target=tgt5, q_default=q_home, target_quat=quat_home, obstacle_center=obs, gains=gn))
+    assert advance._cache_size() == n_cache, "a D1/D2/vel-limit gain change forced a recompile"
+    print(f"[live-tuning] dynamic-mass + KE-cap + vel-limit gains also traced; jit cache still {n_cache}")
 
 
 if __name__ == "__main__":

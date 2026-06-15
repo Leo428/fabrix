@@ -12,13 +12,13 @@ from fabrix.diff import value_jac_curv
 from fabrix.energy import energy_spec, fixed_metric_energy, lagrangian_energy
 from fabrix.fabric import Fabric, FabricParams, GeometricFabric
 from fabrix.geometry import (
-    energize, joint_limit_geometry, joint_limit_potential, obstacle_geometry,
-    obstacle_potential, plane_geometry, plane_potential, sdf_barrier_geometry,
-    sdf_barrier_potential,
+    energize, joint_limit_geometry, joint_limit_potential, joint_speed_limit,
+    obstacle_geometry, obstacle_potential, plane_geometry, plane_potential,
+    sdf_barrier_geometry, sdf_barrier_potential,
 )
-from fabrix.integrate import rollout, step
+from fabrix.integrate import limit_accel, limit_jerk, rollout, step
 from fabrix.kinematics import CustomFK, KinematicsProvider
-from fabrix.leaves import attractor, config_damping, pose_attractor, posture
+from fabrix.leaves import attractor, config_damping, pose_attractor, posture, speed_control
 from fabrix.maps import (
     plane_sdf_map, se3_pose_error_map, site_position_map, sphere_sdf_map,
 )
@@ -29,9 +29,9 @@ __all__ = [
     "value_jac_curv",
     "KinematicsProvider", "CustomFK",
     "site_position_map", "sphere_sdf_map", "plane_sdf_map", "se3_pose_error_map",
-    "attractor", "pose_attractor", "posture", "config_damping",
+    "attractor", "pose_attractor", "posture", "config_damping", "speed_control",
     "energy_spec", "fixed_metric_energy", "lagrangian_energy",
-    "energize", "joint_limit_geometry", "joint_limit_potential",
+    "energize", "joint_limit_geometry", "joint_limit_potential", "joint_speed_limit",
     "obstacle_geometry", "obstacle_potential", "plane_geometry", "plane_potential",
     "sdf_barrier_geometry", "sdf_barrier_potential",
     "SphereModel", "auto_arm_spheres", "nonadjacent_pairs", "load_spheres",
@@ -39,5 +39,5 @@ __all__ = [
     "arm_obstacle_geometry", "arm_obstacle_potential",
     "arm_plane_geometry", "arm_plane_potential",
     "Fabric", "FabricParams", "GeometricFabric",
-    "step", "rollout",
+    "step", "rollout", "limit_accel", "limit_jerk",
 ]

@@ -8,6 +8,30 @@ commanded trajectory, whose derivatives we plot to show C2 smoothness.
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
+
+
+def limit_accel(qdd, a_max):
+    """Bound the acceleration to ``a_max`` by **direction-preserving** uniform scaling.
+
+    Unlike a per-axis clip (``clip(qdd, -a_max, a_max)``), which bends the commanded direction when one
+    joint saturates — distorting the fabric's path — this scales the whole vector by the single factor
+    that brings the most-saturated joint to ``a_max``, so the path direction is preserved. A no-op when
+    ``max|qdd_i| <= a_max`` (the common case). ``a_max`` is a scalar.
+    """
+    peak = jnp.max(jnp.abs(qdd))
+    return qdd * jnp.minimum(1.0, a_max / (peak + 1e-12))
+
+
+def limit_jerk(qdd, qdd_prev, dqdd_max):
+    """Rate-limit the per-step change in acceleration to ``±dqdd_max`` (a per-tick jerk bound).
+
+    Caps ``|qdd − qdd_prev|`` per joint, so the commanded acceleration cannot step discontinuously —
+    gentler starts/stops and a bounded τ feedforward near a person. ``dqdd_max`` is the max ``|Δqdd|``
+    per call (i.e. ``jerk_max · dt`` for a fixed-rate loop); a huge value is a no-op. The caller carries
+    ``qdd_prev`` across ticks.
+    """
+    return qdd_prev + jnp.clip(qdd - qdd_prev, -dqdd_max, dqdd_max)
 
 
 def step(policy, q, qd, params, dt):

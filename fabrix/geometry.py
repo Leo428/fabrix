@@ -253,6 +253,33 @@ def joint_limit_potential(provider, k_p: float = 0.05, d0: float = 0.3, m_p: flo
     return leaf
 
 
+def joint_speed_limit(nq: int, qd_lim=4.0, k_b: float = 0.0, m_b: float = 0.0, d0: float = 0.5,
+                      eps: float = 1e-3):
+    """Per-joint soft velocity limit — smoothly decelerate joint ``j`` as ``|q̇_j|`` enters the band
+    ``d0`` below its speed bound ``qd_lim``. The in-fabric, smooth counterpart to the hard per-axis
+    ``q̇`` clip (which stays a backstop): NVlabs' ``JointSpeedLimitRepulsion`` in our barrier idiom.
+
+    A forcing leaf with an identity map on ``q̇`` (config-space). With margin ``d = qd_lim - |q̇_j|``,
+    inside the band it commands a decelerating ``a_des_j = -sign(q̇_j)·k_b·(1/d − 1/d0)`` (diverges at
+    the bound, 0 at ``d0``) under a priority metric ``m_b·_band(d, d0)`` that grows toward the bound, so
+    the slow-down dominates locally and is exactly zero in normal motion (``|q̇|`` well below the limit —
+    it never fights free movement). ``qd_lim`` is a scalar OR a per-joint ``(nq,)`` vector (the Gen3's
+    per-joint hardware ceiling). This is PER-JOINT; it complements the GLOBAL kinetic-energy cap of
+    :func:`fabrix.leaves.speed_control` (a total-speed ceiling). ``k_b=m_b=0`` (default) ⇒ inert (no-op).
+    """
+
+    def leaf(q, qd, params):
+        ql = jnp.broadcast_to(jnp.asarray(dynamic_gain(qd_lim, params), q.dtype), qd.shape)
+        kb, mb, d0_ = (dynamic_gain(g, params) for g in (k_b, m_b, d0))
+        d = jnp.clip(ql - jnp.abs(qd), eps, None)              # margin to the nearer speed bound
+        within = (d < d0_).astype(q.dtype)
+        a_des = -jnp.sign(qd) * kb * (1.0 / d - 1.0 / d0_) * within   # decelerate; diverges at the bound
+        diag = mb * _band(d, d0_)                              # priority grows toward the bound, 0 beyond d0
+        return Spec(jnp.diag(diag), -diag * a_des)             # f = -M @ a_des (M diagonal)
+
+    return leaf
+
+
 def sdf_barrier_potential(dist, k_p: float = 0.5, d0: float = 0.2, m_p: float = 4.0,
                           margin: float = 0.0, eps: float = 1e-3):
     """Repulsive barrier *potential* on any signed-distance field ``dist(q, params) -> (k,)``, ``k >= 1``.

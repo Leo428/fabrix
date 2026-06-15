@@ -126,6 +126,52 @@ def test_pose_convergence(prov):
     assert float(jnp.abs(jnp.diff(tr["qdd"], axis=0)).max()) < 1.0  # C2: no per-step chatter
 
 
+# ---------------- dynamic (distance-scaled) attractor mass ----------------
+def test_scaled_mass_recovers_constant():
+    # The schedule must (a) reduce to a constant when m_max is None OR == m_min (backward-compat), and
+    # (b) when m_max>m_min, ride high near the goal, low far away, monotone decreasing in ‖e‖.
+    from fabrix.leaves import _scaled_mass
+    e_near, e_far = jnp.array([1e-3, 0.0, 0.0]), jnp.array([1.0, 0.0, 0.0])
+    assert float(_scaled_mass(e_near, 50.0, None, 10.0, 0.1)) == 50.0      # m_max=None ⇒ exact constant
+    assert float(_scaled_mass(e_far, 50.0, None, 10.0, 0.1)) == 50.0
+    for e in (e_near, e_far):                                              # m_max==m_min ⇒ constant (no-op)
+        assert abs(float(_scaled_mass(e, 50.0, 50.0, 10.0, 0.1)) - 50.0) < 1e-9
+    near = float(_scaled_mass(e_near, 50.0, 150.0, 30.0, 0.15))           # genuine schedule
+    far = float(_scaled_mass(e_far, 50.0, 150.0, 30.0, 0.15))
+    assert near > 145.0, f"near-goal mass {near:.1f} should approach m_max=150"
+    assert far < 55.0, f"far-field mass {far:.1f} should approach m_min=50"
+    ms = [float(_scaled_mass(jnp.array([r, 0.0, 0.0]), 50.0, 150.0, 30.0, 0.15))
+          for r in (0.0, 0.05, 0.1, 0.2, 0.5, 1.0)]
+    assert all(ms[i] >= ms[i + 1] - 1e-9 for i in range(len(ms) - 1)), f"not monotone: {ms}"
+
+
+def test_dynamic_mass_kills_posture_leak(prov):
+    # The headline fix. At a goal DISPLACED from q_default, a posture(weight=2) leaf biases the
+    # constant-mass attractor's EE equilibrium (the documented ~10 mm offset + slow orbit). A high
+    # near-goal m_max lets the attractor dominate the metric-weighted combine → tight convergence.
+    # Frictionless rollout, so this proves the effect is the metric competition, not stiction.
+    nq = prov.nq
+    q0 = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    q_goal = q0 + jnp.asarray([0.4, -0.5, 0.3, 0.4, -0.3, 0.5, -0.4])      # reachable, well off home
+    pt, qt = prov.site_pose(q_goal)
+    params = FabricParams(target=pt, q_default=q0, target_quat=qt)         # posture pulls to q0, away from q_goal
+
+    def tail_err(att):
+        fab = GeometricFabric(forcing=[att, posture(nq, weight=2.0)],
+                              damping=[config_damping(nq, b=6.0)],
+                              energy=fixed_metric_energy(nq, jnp.float64))
+        tr = rollout(fab.policy, q0, jnp.zeros(nq), params, 0.002, 6000, prov.site_pos)
+        assert bool(jnp.all(jnp.isfinite(tr["qdd"])))
+        errs = jnp.linalg.norm(tr["ee"][-500:] - pt, axis=1)              # mean over last 1 s (robust to orbit)
+        return float(errs.mean())
+
+    const_err = tail_err(pose_attractor(prov))                             # constant m=50 → ~4.3 mm offset
+    dyn_err = tail_err(pose_attractor(prov, m_max=300.0, sharp=20.0, offset=0.1))  # ~0.77 mm (offset ∝ 1/m_max)
+    assert const_err > 3e-3, f"posture leak should bias the constant-mass EE; only {const_err*1e3:.2f} mm"
+    assert dyn_err < 1e-3, f"dynamic mass should converge sub-mm: {dyn_err*1e3:.2f} mm"
+    assert dyn_err < 0.3 * const_err, f"dynamic {dyn_err*1e3:.2f} mm not <0.3x constant {const_err*1e3:.2f} mm"
+
+
 def test_pose_float32_finite(prov32):
     # float32 deployment path: a short rollout toward a reachable pose must stay finite and make
     # progress (jaxlie's Log threshold must not blow up in single precision).

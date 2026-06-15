@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import jax
 import jax.numpy as jnp
 
 from fabrix.diff import value_jac_curv
@@ -38,44 +39,80 @@ def _restoring(e, k: float, f_max: Optional[float], eps: float = 1e-3):
     return f_max * jnp.tanh(k * r / f_max) * (e / r)
 
 
+def _scaled_mass(e, m_min, m_max, sharp: float, offset: float, eps: float = 1e-3):
+    """Distance-scaled attractor priority metric ``m(‖e‖)``: ``m_max`` near the goal, ``m_min`` far.
+
+    NVlabs-style tanh switch ``(m_max−m_min)·(½tanh(−sharp·(r−offset))+½) + m_min`` on the softened
+    norm ``r=√(e·e+eps²)`` (smooth + NaN-free at ``e=0``). A high near-goal mass makes the attractor
+    dominate the metric-weighted combine so a low-priority posture leaf cannot bias the equilibrium
+    (kills the standing TCP offset + slow orbit); the low far-field mass keeps large moves gentle and
+    lets posture/geometry lead. ``m_max is None`` → constant ``m_min`` (the M1–M3 behavior, exact).
+
+    ``m`` scales BOTH the metric and the force ``f = m·(restoring+b·ẋ)`` equally, so it cancels from the
+    isolated accel ``a_des`` — the schedule only re-weights combine priority, never the convergence
+    dynamics (``k``, ``b``) or the saturating ``f_max``.
+    """
+    if m_max is None:
+        return m_min
+    r = jnp.sqrt(e @ e + eps * eps)
+    s = 0.5 * jnp.tanh(-sharp * (r - offset)) + 0.5
+    return (m_max - m_min) * s + m_min
+
+
 def attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
-              f_max: Optional[float] = None):
-    """EE-position attractor. Desired accel ``-(g(x-x*) + b ẋ)``; priority metric ``m·I₃``.
+              f_max: Optional[float] = None, m_max=None, sharp: float = 10.0, offset: float = 0.1):
+    """EE-position attractor. Desired accel ``-(g(x-x*) + b ẋ)``; priority metric ``m(‖e‖)·I₃``.
 
     ``k`` sets stiffness (ω=√k), ``b`` damping (b=2√k is critical), ``m`` the task priority
     relative to posture/damping. ``g`` is the restoring force: quadratic (``k·e``) by default, or
     gradient-saturating with magnitude capped at ``f_max`` (see :func:`_restoring`).
+
+    With ``m_max`` set, the priority metric is **distance-scaled** ``m(‖e‖)`` (see :func:`_scaled_mass`):
+    ``m`` is the far-field floor and ``m_max`` the near-goal priority, switching at radius ``offset``
+    with sharpness ``sharp``. High near the goal → the attractor dominates so a posture leaf cannot bias
+    the EE equilibrium; low far away → gentle large moves. ``m_max=None`` (default) → the constant ``m``
+    (unchanged M1–M3 behavior).
     """
     phi = site_position_map(provider)
 
     def leaf(q, qd, params):
         x, J, Jdq = value_jac_curv(phi, q, qd)
+        e = x - params.target
         xd = J @ qd
-        k_, b_, m_, fm_ = (dynamic_gain(g, params) for g in (k, b, m, f_max))
+        k_, b_, fm_, mmax_ = (dynamic_gain(g, params) for g in (k, b, f_max, m_max))
+        m_min_, sh_, of_ = (dynamic_gain(g, params) for g in (m, sharp, offset))
+        m_ = _scaled_mass(e, m_min_, mmax_, sh_, of_)
         M = m_ * jnp.eye(3, dtype=x.dtype)
-        f = m_ * (_restoring(x - params.target, k_, fm_) + b_ * xd)  # = -M @ a_des
+        f = m_ * (_restoring(e, k_, fm_) + b_ * xd)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
     return leaf
 
 
 def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
-                   f_max: Optional[float] = None):
+                   f_max: Optional[float] = None, m_max=None, sharp: float = 10.0, offset: float = 0.1):
     """Full 6-DOF SE(3) pose attractor. Drives the coupled pose error to zero.
 
     Task = ``e(q) = Log(T*^{-1} T(q)) in se(3)`` (``params.target`` position + ``params.target_quat``
-    orientation, wxyz). Desired accel ``-(g(e) + b ė)``; priority metric ``m·I₆`` (one shared metric
+    orientation, wxyz). Desired accel ``-(g(e) + b ė)``; priority metric ``m(‖e‖)·I₆`` (one shared metric
     over the 6 twist coordinates, the coupled-SE(3) choice). ``g`` is the restoring force: quadratic
     by default, or gradient-saturating capped at ``f_max`` (bounded accel on far/commanded moves; note
     one ``f_max`` mixes the translation (m) and rotation (rad) scales of the 6-D twist). Use alongside
     :func:`posture`/:func:`config_damping` to resolve redundancy; the approach is a geodesic screw.
+
+    With ``m_max`` set, the metric is **distance-scaled** ``m(‖e‖)`` (see :func:`_scaled_mass`): high near
+    the goal so the attractor dominates a posture leaf (no EE-equilibrium bias / orbit), low far away for
+    gentle large moves. ``offset`` (the switch radius) is on the same mixed-units 6-D ``‖e‖`` as ``f_max``.
+    ``m_max=None`` (default) → the constant ``m`` (unchanged M1–M3 behavior).
     """
 
     def leaf(q, qd, params):
         phi = se3_pose_error_map(provider, params.target, params.target_quat)
         e, J, Jdq = value_jac_curv(phi, q, qd)
         ed = J @ qd
-        k_, b_, m_, fm_ = (dynamic_gain(g, params) for g in (k, b, m, f_max))
+        k_, b_, fm_, mmax_ = (dynamic_gain(g, params) for g in (k, b, f_max, m_max))
+        m_min_, sh_, of_ = (dynamic_gain(g, params) for g in (m, sharp, offset))
+        m_ = _scaled_mass(e, m_min_, mmax_, sh_, of_)
         M = m_ * jnp.eye(6, dtype=e.dtype)
         f = m_ * (_restoring(e, k_, fm_) + b_ * ed)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
@@ -116,6 +153,36 @@ def config_damping(nq: int, b: float = 2.0, mass: float = 1.0):
         mass_, b_ = dynamic_gain(mass, params), dynamic_gain(b, params)
         M = mass_ * jnp.eye(nq, dtype=q.dtype)
         f = mass_ * b_ * qd  # = -M @ (-b q̇)  → isolated accel -b·q̇
+        return Spec(M, f)
+
+    return leaf
+
+
+def speed_control(nq: int, b: float = 2.0, beta_speed=0.0, E_max=1e9, k_gate: float = 20.0,
+                  mass: float = 1.0):
+    """Config-space damping with a kinetic-energy cap — the speed-regulated successor to
+    :func:`config_damping`. Two additive, metric-scaled terms:
+
+    * **baseline damping ``b``** — the execution-speed knob. Isolated accel ``−b·q̇``; steady cruise
+      ``≈ ‖a_des‖/b``, so a *lower* ``b`` runs *faster*. (This is what lets the rest of the damping
+      stack come down once the cap below owns safety.)
+    * **overspeed boost** — a HARD kinetic-energy ceiling for human-proximity safety: with
+      ``E = ½‖q̇‖²``, the gate ``σ(k_gate·(E−E_max)) ∈ (0,1)`` is ~0 below the cap and →1 above it,
+      adding strong damping ``beta_speed·M·q̇`` that bleeds energy until ``E ≤ E_max``. The smooth
+      sigmoid (not a hard ``E>E_max`` step) keeps the command C1.
+
+    NVlabs *decelerate-only* form: it never injects energy to reach a target speed (safe near a seated
+    person). Config-space ``E`` bounds EVERY joint (the elbow toward a bystander too), not just the EE.
+    ``beta_speed=0`` (the default) ⇒ ``b_eff=b`` ⇒ bit-identical to :func:`config_damping`.
+    """
+
+    def leaf(q, qd, params):
+        b_, beta_, emax_, kg_, mass_ = (dynamic_gain(g, params)
+                                        for g in (b, beta_speed, E_max, k_gate, mass))
+        E = 0.5 * (qd @ qd)
+        b_eff = b_ + beta_ * jax.nn.sigmoid(kg_ * (E - emax_))   # baseline + overspeed (KE-cap) damping
+        M = mass_ * jnp.eye(nq, dtype=q.dtype)
+        f = mass_ * b_eff * qd  # = -M @ (-b_eff q̇)  → isolated accel -b_eff·q̇
         return Spec(M, f)
 
     return leaf
