@@ -146,6 +146,48 @@ def posture(nq: int, k=1.0, b: float = 2.0, weight=0.5):
     return leaf
 
 
+def cspace_attractor(nq: int, gain=1.0, sharp: float = 10.0, weight=1.0, eps: float = 1e-3):
+    """NVlabs-style config-space attractor toward ``params.q_default`` as an ENERGIZED HD2 GEOMETRY.
+
+    The faithful port of fabrics_sim's ``cspace_attractor`` (which is a *geometry*, not a forced
+    potential like :func:`posture`). Isolated acceleration::
+
+        e = q - params.q_default,   r = ‖e‖ (softened),   ê = e / r
+        a = -‖q̇‖² · gain·tanh(sharp·r) · ê                 # points toward q_default
+
+    Three properties distinguish it from the linear-spring :func:`posture` (and they map 1:1 onto the
+    "feels asymmetric" complaint the spring caused):
+
+    * **Saturating conical pull** — magnitude ``gain·tanh(sharp·r)``: ~linear near home (slope
+      ``gain·sharp`` → a crisp return) but **capped at ``gain`` far away**, so a big excursion for a
+      dexterous move is *not* fought by an ever-growing force (the spring's ``k·r`` is). ``gain`` caps
+      the far-field resistance; ``sharp`` sets the near-home snap — two independent knobs the single
+      spring ``k`` could not separate.
+    * **Homogeneous degree 2** (the ``‖q̇‖²`` factor) — a true geometry: **zero force at rest**, paths
+      independent of execution speed. It shapes motion already underway rather than statically yanking,
+      so it never competes for the "should I be moving" decision — energy + damping own that.
+    * **No internal damping** — put this in ``GeometricFabric.geometries`` so it is root-energized
+      against the execution energy; convergence/dissipation come from the separate :func:`speed_control`
+      + reference damping (NVlabs' decoupled cspace energy + damper).
+
+    Priority metric is the constant isotropic ``weight·I`` (their ``isotropic_metric``); ``weight`` may
+    be a per-joint ``(nq,)`` array (hold the shoulder/elbow toward home, free the wrist) and cancels
+    from ``a``. ``weight=0`` ⇒ ``M=0, f=0`` ⇒ a fully inert leaf (exact no-op — the wired default).
+    """
+    def leaf(q, qd, params):
+        g_, sh_, w_ = (dynamic_gain(x, params) for x in (gain, sharp, weight))
+        wv = jnp.broadcast_to(jnp.asarray(w_), (nq,)).astype(q.dtype)
+        M = jnp.diag(wv)
+        e = q - params.q_default
+        r = jnp.sqrt(e @ e + eps * eps)                  # softened norm: smooth + NaN-free at e=0
+        speed2 = qd @ qd                                 # ‖q̇‖²  → HD2 (zero force at rest)
+        a_des = -(speed2 * g_ * jnp.tanh(sh_ * r) / r) * e   # toward q_default; saturating; HD2
+        f = -M @ a_des  # = wv · (speed2·gain·tanh(sharp·r)/r) · e   (per-joint weight cancels in a_des)
+        return Spec(M, f)
+
+    return leaf
+
+
 def config_damping(nq: int, b: float = 2.0, mass: float = 1.0):
     """Pure joint-space damping: global dissipation + a full-rank metric contribution."""
 

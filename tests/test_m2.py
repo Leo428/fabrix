@@ -203,6 +203,36 @@ def test_speed_control_reduces_to_damping(prov):
         assert float(jnp.abs(s1.M - s2.M).max()) < 1e-12 and float(jnp.abs(s1.f - s2.f).max()) < 1e-12
 
 
+def test_geometric_fabric_reference_damping(prov):
+    # GeometricFabric's post-combine reference damping is NVlabs' cspace_damping (fabrics_sim
+    # fabric.py:521, force += gain·M·q̇): applied to the COMBINED metric so it cancels, adding EXACTLY
+    # -b·qd_ref to the accel regardless of the metric — and only when params.qd_ref is set. Integrated by
+    # the control node's pure q̇_ref += dt·a, this is the leaky reference integrator (1-dt·b)q̇_ref+dt·a.
+    nq = prov.nq
+    rng = np.random.default_rng(13)
+    # config_damping gives the combined metric a full-rank mass·I floor (the real fabric always has
+    # speed_control), so the post-combine cancellation is exact (reg=1e-6 ≪ the eigenvalues).
+    base = dict(forcing=[attractor(prov, k=20.0, b=8.0, m=50.0)], damping=[config_damping(nq, b=2.0)],
+                energy=fixed_metric_energy(nq, jnp.float64))
+    fab0 = GeometricFabric(**base)                              # no reference damping (ref_damp=None)
+    fabb = GeometricFabric(**base, ref_damp=3.0)               # b=3 reference damping, post-combine
+    q0 = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    pt = prov.site_pos(q0)
+    for _ in range(15):
+        q = q0 + jnp.asarray(rng.uniform(-0.3, 0.3, nq))
+        qd = jnp.asarray(rng.uniform(-2, 2, nq))
+        qd_ref = jnp.asarray(rng.uniform(-2, 2, nq))
+        a0 = fab0.policy(q, qd, FabricParams(pt, q0, qd_ref=qd_ref))   # ref_damp None ⇒ qd_ref ignored
+        ab = fabb.policy(q, qd, FabricParams(pt, q0, qd_ref=qd_ref))
+        # = -b·qd_ref, metric-cancelled; the residual is just the resolve's Tikhonov reg=1e-6 floor
+        # (reg·(M+reg)⁻¹·b·qd_ref ≈ µrad/s²), far below the rad/s²-scale damping term.
+        assert float(jnp.abs((ab - a0) - (-3.0 * qd_ref)).max()) < 1e-4
+    # params.qd_ref is None ⇒ reference damping inert: backward-compatible with every non-reference fabric
+    a_none = fabb.policy(q, qd, FabricParams(pt, q0))
+    a_zero = fab0.policy(q, qd, FabricParams(pt, q0))
+    assert float(jnp.abs(a_none - a_zero).max()) < 1e-6
+
+
 def test_speed_cap_respected(prov):
     # The overspeed boost bounds peak kinetic energy E=½‖q̇‖². With a saturating attractor (bounded
     # drive) the cap holds near E_max; it is a smooth soft-cap so a step command overshoots ~30% on the

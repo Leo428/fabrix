@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import jax_dataclasses as jdc
 
 from fabrix.geometry import energize
-from fabrix.spec import Spec, combine, resolve
+from fabrix.spec import Spec, combine, dynamic_gain, resolve
 
 
 @jdc.pytree_dataclass
@@ -36,6 +36,11 @@ class FabricParams:
     # construction (the M1–M3 default), so this stays fully backward-compatible — see
     # :func:`fabrix.spec.dynamic_gain`.
     gains: Any = None
+    # (nq,) integrated REFERENCE velocity q̇_ref, consumed only by :func:`fabrix.leaves.reference_damping`
+    # (NVlabs' cspace_damping on the reference). The closed-loop fabric is evaluated on the MEASURED q̇,
+    # so the control node passes its integrator's q̇_ref here for the one leaf that must damp the
+    # reference — not the measured — velocity. ``None`` ⇒ that leaf is inert (every other fabric).
+    qd_ref: Any = None
 
 
 class Fabric:
@@ -72,12 +77,17 @@ class GeometricFabric:
     ``energy`` is a callable ``energy(q, qd) -> (M_e, f_e)`` (see :mod:`fabrix.energy`).
     """
 
-    def __init__(self, *, geometries=(), forcing=(), damping=(), energy,
+    def __init__(self, *, geometries=(), forcing=(), damping=(), energy, ref_damp=None,
                  reg: float = 1e-6, geom_reg: float = 1e-4):
         self.geometries = tuple(geometries)  # static structure (unrolls at trace time)
         self.forcing = tuple(forcing)
         self.damping = tuple(damping)
         self.energy = energy
+        # Optional NVlabs-style reference-velocity damping (cspace_damping on q̇_ref), a scalar or a
+        # callable gain ``lambda p: p.gains...``. Applied POST-combine (see _policy) so it cancels the
+        # metric and adds exactly −b·q̇_ref — the closed-loop placement of the damping NVlabs' open-loop
+        # fabric applies to its own integrated reference. ``None`` ⇒ off (every M1–M3 fabric).
+        self.ref_damp = ref_damp
         self.reg = float(reg)
         # geom_reg regularizes the (often rank-deficient) barrier-metric solve for a_g; it must sit
         # comfortably above float32 eps (~1e-7), else a small barrier metric amplifies float32 noise
@@ -95,8 +105,16 @@ class GeometricFabric:
         M_e, f_e = self.energy(q, qd)
         a_e = energize(a_g, qd, M_e, f_e)
         geo = Spec(M_e, -M_e @ a_e)
-        # 3. add forcing + damping and resolve
+        # 3. add forcing + damping, combine
         specs = [geo]
         specs += [leaf(q, qd, params) for leaf in self.forcing]
         specs += [leaf(q, qd, params) for leaf in self.damping]
-        return resolve(combine(specs), self.reg)
+        root = combine(specs)
+        # 4. NVlabs cspace_damping on the REFERENCE velocity (fabrics_sim fabric.py:521,
+        # ``force += gain·M·q̇``), applied to the COMBINED metric so it cancels: the accel gains exactly
+        # −b·q̇_ref (unweighted), matching the reference damping NVlabs' integrator feeds back open-loop.
+        # ``q̇_ref`` is None for fabrics that don't stream a reference ⇒ this is skipped (static branch).
+        if self.ref_damp is not None and params.qd_ref is not None:
+            b_ref = dynamic_gain(self.ref_damp, params)
+            root = Spec(root.M, root.f + b_ref * (root.M @ params.qd_ref))
+        return resolve(root, self.reg)

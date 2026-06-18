@@ -34,7 +34,7 @@ import numpy as np
 from loop_rate_limiters import RateLimiter
 
 from fabrix import (CustomFK, FabricParams, GeometricFabric, arm_obstacle_geometry,
-                    arm_obstacle_potential, arm_plane_geometry, arm_plane_potential,
+                    arm_obstacle_potential, arm_plane_geometry, arm_plane_potential, cspace_attractor,
                     fixed_metric_energy, joint_limit_geometry, joint_limit_potential,
                     joint_speed_limit, limit_accel, load_spheres, nonadjacent_pairs, pose_attractor,
                     posture, self_collision_geometry, self_collision_potential, speed_control)
@@ -76,6 +76,12 @@ class Gains(NamedTuple):
     posture_w: float = 2.0
     posture_k: float = 2.0
     posture_b: float = 2.83
+    # NVlabs-aligned config-space attractor (HD2 energized geometry toward home): saturating conical pull
+    # ×‖q̇‖² (gentle during dexterous moves, zero force at rest). cspace_w=0 ⇒ inert (linear posture leads);
+    # set cspace_w>0 (+ posture_w 0) to A/B the aligned mode. cspace_gain caps the far-field, near slope = gain·sharp.
+    cspace_w: float = 0.0
+    cspace_gain: float = 8.0
+    cspace_sharp: float = 10.0
     cfg_damp: float = 2.0
     # speed control / KE cap (D2): cfg_damp is baseline damping b; speed_beta is the overspeed boost when
     # E=½‖q̇‖² exceeds speed_E_max (human-proximity safety). speed_beta=0 ⇒ no cap = constant config_damping.
@@ -155,7 +161,8 @@ def _controller():
                                             k_b=g("self_geom_kb"), m_b=g("self_geom_mb"), d0=g("self_geom_d0")),
                     joint_limit_geometry(prov),
                     arm_plane_geometry(prov, sph, floor_pt, floor_n,
-                                       k_b=g("floor_geom_kb"), m_b=g("floor_geom_mb"), d0=g("floor_geom_d0"))],
+                                       k_b=g("floor_geom_kb"), m_b=g("floor_geom_mb"), d0=g("floor_geom_d0")),
+                    cspace_attractor(nq, gain=g("cspace_gain"), sharp=g("cspace_sharp"), weight=g("cspace_w"))],
         forcing=[pose_attractor(prov, k=g("pose_k"), b=g("pose_b"), m=g("pose_m"), f_max=g("pose_fmax"),
                                 m_max=g("pose_m_max"), sharp=g("pose_m_sharp"), offset=g("pose_m_offset")),
                  posture(nq, k=g("posture_k"), b=g("posture_b"), weight=g("posture_w")),
@@ -195,6 +202,9 @@ _GUI = [
     ("Posture / damping", [("posture_w", "posture weight", 0.0, 20.0, 0.1), ("posture_k", "posture k", 0.0, 20.0, 0.1),
                            ("posture_b", "posture b", 0.0, 20.0, 0.05), ("cfg_damp", "damping b (cruise)", 0.0, 20.0, 0.1),
                            ("speed_beta", "overspeed β (D2)", 0.0, 100.0, 1.0), ("speed_E_max", "KE cap ½‖q̇‖²", 0.05, 5.0, 0.05)]),
+    ("cspace attractor (NVlabs HD2)", [("cspace_w", "cspace weight (0=off)", 0.0, 20.0, 0.1),
+                                       ("cspace_gain", "conical gain (far cap)", 0.0, 100.0, 1.0),
+                                       ("cspace_sharp", "conical sharp (near slope)", 1.0, 40.0, 1.0)]),
     ("Obstacle barrier", [("obst_geom_d0", "geom d0 (m)", 0.005, 0.30, 0.005), ("obst_geom_kb", "geom k_b", 0.0, 5.0, 0.05),
                           ("obst_geom_mb", "geom m_b", 0.0, 10.0, 0.1), ("obst_pot_d0", "wall d0 (m)", 0.005, 0.20, 0.005),
                           ("obst_pot_kp", "wall k_p", 0.0, 5.0, 0.05), ("obst_pot_mp", "wall m_p", 0.0, 10.0, 0.1)]),
@@ -419,11 +429,12 @@ def check():
     # D1/D2/D-vel gains are traced too: toggling dynamic mass, the KE cap, and the velocity-limit
     # barrier mid-run must not recompile.
     for gn in (Gains(pose_m_max=300.0, pose_m_offset=0.08), Gains(speed_beta=60.0, speed_E_max=0.3),
-               Gains(qsl_kb=5.0, qsl_mb=20.0)):
+               Gains(qsl_kb=5.0, qsl_mb=20.0),
+               Gains(posture_w=0.0, cspace_w=1.0, cspace_gain=8.0)):  # toggle the NVlabs HD2 cspace attractor
         advance(q_home, jnp.zeros(nq, jnp.float32),
                 FabricParams(target=tgt5, q_default=q_home, target_quat=quat_home, obstacle_center=obs, gains=gn))
-    assert advance._cache_size() == n_cache, "a D1/D2/vel-limit gain change forced a recompile"
-    print(f"[live-tuning] dynamic-mass + KE-cap + vel-limit gains also traced; jit cache still {n_cache}")
+    assert advance._cache_size() == n_cache, "a D1/D2/vel-limit/cspace gain change forced a recompile"
+    print(f"[live-tuning] dynamic-mass + KE-cap + vel-limit + cspace gains also traced; jit cache still {n_cache}")
 
 
 if __name__ == "__main__":

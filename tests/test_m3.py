@@ -24,8 +24,8 @@ import numpy as np
 import pytest
 
 from fabrix import (
-    CustomFK, FabricParams, GeometricFabric, config_damping, fixed_metric_energy,
-    pose_attractor, posture, rollout, se3_pose_error_map,
+    CustomFK, FabricParams, GeometricFabric, attractor, config_damping, cspace_attractor,
+    fixed_metric_energy, pose_attractor, posture, rollout, se3_pose_error_map,
 )
 from fabrix.diff import value_jac_curv
 
@@ -170,6 +170,117 @@ def test_dynamic_mass_kills_posture_leak(prov):
     assert const_err > 3e-3, f"posture leak should bias the constant-mass EE; only {const_err*1e3:.2f} mm"
     assert dyn_err < 1e-3, f"dynamic mass should converge sub-mm: {dyn_err*1e3:.2f} mm"
     assert dyn_err < 0.3 * const_err, f"dynamic {dyn_err*1e3:.2f} mm not <0.3x constant {const_err*1e3:.2f} mm"
+
+
+# ---------------- NVlabs-style config-space attractor (energized HD2 geometry) ----------------
+def test_cspace_attractor_unit_properties():
+    # The faithful-port math: HD2 (zero force at rest), saturating conical magnitude (linear near home,
+    # capped far away), pull toward q_default, per-joint weight cancels from a_des, weight=0 ⇒ inert.
+    nq = 7
+    leaf = cspace_attractor(nq, gain=3.0, sharp=8.0, weight=2.0)
+    q0 = jnp.zeros(nq)
+    qd = jnp.ones(nq) * 0.5
+    e = jnp.array([0.4, -0.3, 0.2, 0.1, -0.2, 0.3, -0.1])     # q - q_default
+    params = FabricParams(target=jnp.zeros(3), q_default=-e)  # so q0 - q_default = e
+
+    # (a) HD2: zero force at rest, and force scales with ‖q̇‖² (quadruple q̇ → quadruple f)
+    f_rest = cspace_attractor(nq, gain=3.0, sharp=8.0, weight=2.0)(q0, jnp.zeros(nq), params).f
+    assert float(jnp.linalg.norm(f_rest)) < 1e-12, "HD2 geometry must give zero force at rest"
+    f1 = leaf(q0, qd, params).f
+    f2 = leaf(q0, 2.0 * qd, params).f
+    assert jnp.allclose(f2, 4.0 * f1, atol=1e-6), "force must be homogeneous degree 2 in q̇"
+
+    # (b) direction: isolated accel a = -M⁻¹ f points toward q_default (anti-parallel to e = q-q_default)
+    spec = leaf(q0, qd, params)
+    a_des = -jnp.linalg.solve(spec.M, spec.f)
+    cos = float(a_des @ (-e) / (jnp.linalg.norm(a_des) * jnp.linalg.norm(e)))
+    assert cos > 0.9999, f"acceleration must point toward q_default (along -e); cos={cos:.5f}"
+
+    # (c) saturating magnitude: ‖a‖/‖q̇‖² ≈ gain·sharp·r near home (linear), → gain far away (capped)
+    speed2 = float(qd @ qd)
+    def amag(r):
+        ee = jnp.zeros(nq).at[0].set(r)
+        p = FabricParams(target=jnp.zeros(3), q_default=-ee)
+        s = cspace_attractor(nq, gain=3.0, sharp=8.0, weight=2.0)(q0, qd, p)
+        return float(jnp.linalg.norm(jnp.linalg.solve(s.M, s.f))) / speed2
+    near, far = amag(1e-3), amag(50.0)
+    assert abs(near - 3.0 * 8.0 * 1e-3) < 1e-3, f"near-home slope should be gain·sharp: {near:.4f}"
+    assert abs(far - 3.0) < 1e-3, f"far-field magnitude should saturate at gain=3: {far:.4f}"
+
+    # (d) per-joint weight cancels from a_des (only re-weights priority, never the target accel)
+    a1 = -jnp.linalg.solve(cspace_attractor(nq, gain=3.0, sharp=8.0, weight=1.0)(q0, qd, params).M,
+                           cspace_attractor(nq, gain=3.0, sharp=8.0, weight=1.0)(q0, qd, params).f)
+    wv = jnp.array([5.0, 1.0, 3.0, 0.5, 2.0, 4.0, 1.5])
+    sp = cspace_attractor(nq, gain=3.0, sharp=8.0, weight=wv)(q0, qd, params)
+    a_pj = -jnp.linalg.solve(sp.M, sp.f)
+    assert jnp.allclose(a1, a_pj, atol=1e-6), "per-joint weight must cancel from the isolated accel"
+
+    # (e) weight=0 ⇒ M=0, f=0 ⇒ fully inert (the wired no-op default)
+    s0 = cspace_attractor(nq, gain=3.0, sharp=8.0, weight=0.0)(q0, qd, params)
+    assert float(jnp.abs(s0.M).max()) == 0.0 and float(jnp.abs(s0.f).max()) == 0.0
+
+
+def test_cspace_attractor_inert_is_byte_identical(prov):
+    # Adding the geometry at weight=0 to a real fabric must not change the policy output at all
+    # (M=0,f=0 contributes nothing to the geometry combine) — the no-op-default guarantee.
+    nq = prov.nq
+    q0 = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    qd = jnp.asarray(np.random.default_rng(3).uniform(-0.5, 0.5, nq))
+    pt, qt = prov.site_pose(q0 + 0.25)
+    params = FabricParams(target=pt, q_default=q0, target_quat=qt)
+    base = GeometricFabric(forcing=[pose_attractor(prov), posture(nq, weight=2.0)],
+                           damping=[config_damping(nq, b=6.0)], energy=fixed_metric_energy(nq, jnp.float64))
+    with_inert = GeometricFabric(geometries=[cspace_attractor(nq, weight=0.0)],
+                                 forcing=[pose_attractor(prov), posture(nq, weight=2.0)],
+                                 damping=[config_damping(nq, b=6.0)], energy=fixed_metric_energy(nq, jnp.float64))
+    assert jnp.allclose(base.policy(q0, qd, params), with_inert.policy(q0, qd, params), atol=1e-10)
+
+
+def test_cspace_attractor_redirects_motion_home(prov):
+    # Mechanism: with no task, the energized cspace geometry + damping bends a MOVING arm toward
+    # q_default — it ends closer to home than a free damped coast (gain=0). The effect is modest BY
+    # CONSTRUCTION: being HD2 it redirects the kick's kinetic energy, it does not pull from rest, so
+    # the strong at-rest homing the linear `posture` gives is *not* what this term provides (it can't —
+    # that's the documented tradeoff; a forced cspace potential is the at-rest homing knob).
+    nq = prov.nq
+    q_home = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    q0 = q_home + jnp.asarray([0.3, -0.35, 0.25, 0.3, -0.2, 0.35, -0.25])
+    qd0 = jnp.asarray([0.4, -0.3, 0.3, 0.2, -0.25, 0.3, -0.2])              # a kick to energize the HD2 term
+    params = FabricParams(target=prov.site_pos(q_home), q_default=q_home)
+
+    def run(gain):
+        fab = GeometricFabric(geometries=[cspace_attractor(nq, gain=gain, sharp=10.0, weight=1.0)],
+                              damping=[config_damping(nq, b=2.0)], energy=fixed_metric_energy(nq, jnp.float64))
+        tr = rollout(fab.policy, q0, qd0, params, 0.002, 6000, prov.site_pos)
+        assert bool(jnp.all(jnp.isfinite(tr["qdd"])))
+        return (float(jnp.linalg.norm(tr["q"][-1] - q_home)),
+                float(jnp.linalg.norm(tr["q"][-1] - tr["q"][-2]) / 0.002))
+
+    d_on, qd_on = run(8.0)
+    d_off, _ = run(0.0)
+    assert d_on < 0.9 * d_off, f"geometry should redirect toward home: on {d_on:.3f} vs off {d_off:.3f} rad"
+    assert qd_on < 5e-3, f"arm should settle (qd→0): {qd_on:.4f} rad/s"
+
+
+def test_cspace_attractor_does_not_bias_ee(prov):
+    # The redundancy guarantee: adding the geometry must NOT pull the EE off the task goal. A strong
+    # position attractor reaches the goal equally well with the geometry on (gain=8) or off (gain=0).
+    nq = prov.nq
+    q_home = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    q_goal = q_home + jnp.asarray([0.5, -0.4, 0.4, 0.5, -0.6, 0.5, -0.5])
+    pt = prov.site_pos(q_goal)
+    params = FabricParams(target=pt, q_default=q_home)
+
+    def ee_err(gain):
+        fab = GeometricFabric(geometries=[cspace_attractor(nq, gain=gain, sharp=10.0, weight=1.0)],
+                              forcing=[attractor(prov, m_max=300.0, sharp=20.0, offset=0.1)],
+                              damping=[config_damping(nq, b=6.0)], energy=fixed_metric_energy(nq, jnp.float64))
+        tr = rollout(fab.policy, q_home, jnp.zeros(nq), params, 0.002, 8000, prov.site_pos)
+        assert bool(jnp.all(jnp.isfinite(tr["qdd"])))
+        return float(jnp.linalg.norm(tr["ee"][-1] - pt))
+
+    assert ee_err(8.0) < 3e-3, "geometry must not bias the EE off the goal"
+    assert ee_err(0.0) < 3e-3, "control: attractor reaches the goal"
 
 
 def test_pose_float32_finite(prov32):
