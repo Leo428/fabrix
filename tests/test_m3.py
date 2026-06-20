@@ -24,8 +24,9 @@ import numpy as np
 import pytest
 
 from fabrix import (
-    CustomFK, FabricParams, GeometricFabric, attractor, config_damping, cspace_attractor,
-    fixed_metric_energy, pose_attractor, posture, rollout, se3_pose_error_map,
+    CustomFK, FabricParams, GeometricFabric, attractor, config_damping, control_point_jack,
+    control_points_error_map, cspace_attractor, fixed_metric_energy, pose_attractor,
+    pose_points_attractor, posture, rollout, se3_pose_error_map,
 )
 from fabrix.diff import value_jac_curv
 
@@ -311,3 +312,151 @@ def test_pose_latency_guard(prov32):
         s = time.perf_counter(); fab.policy(qz, qz, p).block_until_ready(); ts.append(time.perf_counter() - s)
     us = min(ts) * 1e6
     assert us < 300.0, f"pose policy {us:.0f} us"  # measured ~88 us; generous guard for the jaxlie path
+
+
+# ---------------- control-points pose attractor (B2, the NVlabs construction) ----------------
+def _points_fabric(prov, dtype, offsets, b=6.0, **att):
+    nq = prov.nq
+    return GeometricFabric(forcing=[pose_points_attractor(prov, offsets, **att), posture(nq)],
+                           damping=[config_damping(nq, b=b)], energy=fixed_metric_energy(nq, dtype))
+
+
+def _peak_ang_speed(prov, qs, dt):
+    """Peak EE angular speed (rad/s) along a config-space trajectory, via FK orientation."""
+    quats = jax.vmap(lambda qq: prov.site_pose(qq)[1])(qs)
+
+    def so3(qw):
+        return jaxlie.SO3.from_quaternion_xyzw(jnp.concatenate([qw[1:], qw[:1]]))
+
+    def w(q1, q2):
+        return jnp.linalg.norm((so3(q1).inverse() @ so3(q2)).log())
+
+    return float(jnp.max(jax.vmap(w)(quats[:-1], quats[1:])) / dt)
+
+
+def test_control_points_error_zero_at_target(prov):
+    # Zero exactly when the site reaches the target pose (the origin point pins position, the offsets pin
+    # orientation). Analogue of test_se3_error_zero_at_target for the (3P,) point representation.
+    rng = np.random.default_rng(10)
+    q = jnp.asarray(rng.uniform(-1, 1, prov.nq))
+    p, quat = prov.site_pose(q)
+    offs = control_point_jack(0.1)
+    e = control_points_error_map(prov, p, quat, offs)(q)  # target == current pose
+    assert e.shape == (3 * offs.shape[0],)
+    assert float(jnp.linalg.norm(e)) < 1e-10
+
+
+def test_control_points_jacobian_finite_diff(prov):
+    # J = de/dq and curvature Jdq (through the FK + fixed local offsets, no SE(3) log) match finite diffs.
+    rng = np.random.default_rng(11)
+    q = jnp.asarray(rng.uniform(-1, 1, prov.nq))
+    qd = jnp.asarray(rng.uniform(-1, 1, prov.nq))
+    pt, qt = prov.site_pose(q + 0.3)
+    offs = control_point_jack(0.1)
+    phi = control_points_error_map(prov, pt, qt, offs)
+    e, J, Jdq = value_jac_curv(phi, q, qd)
+    assert e.shape == (21,) and J.shape == (21, prov.nq)
+    assert bool(jnp.all(jnp.isfinite(J))) and bool(jnp.all(jnp.isfinite(Jdq)))
+    eps = 1e-6
+    v = jnp.asarray(rng.uniform(-1, 1, prov.nq))
+    fd_J = (phi(q + eps * v) - phi(q - eps * v)) / (2 * eps)
+    assert float(jnp.linalg.norm(fd_J - J @ v)) < 1e-7
+    fd_Jdq = (jax.jacfwd(phi)(q + eps * qd) @ qd - jax.jacfwd(phi)(q - eps * qd) @ qd) / (2 * eps)
+    assert float(jnp.linalg.norm(fd_Jdq - Jdq)) < 1e-7
+
+
+def test_pose_points_convergence(prov):
+    # Headline correctness + parity: a purely-positional control-points attractor (NO SE(3) twist) must
+    # converge in BOTH position and orientation to the same reachable target the twist attractor reaches.
+    nq = prov.nq
+    q0 = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    q_goal = q0 + jnp.asarray([0.3, -0.4, 0.2, 0.3, -0.2, 0.4, -0.3])
+    pt, qt = prov.site_pose(q_goal)
+    fab = _points_fabric(prov, jnp.float64, control_point_jack(0.1), f_max=20.0)
+    params = FabricParams(target=pt, q_default=q0, target_quat=qt)
+    tr = rollout(fab.policy, q0, jnp.zeros(nq), params, 0.002, 4000, prov.site_pos)
+    pf, quatf = prov.site_pose(tr["q"][-1])
+    assert bool(jnp.all(jnp.isfinite(tr["qdd"])))
+    assert float(jnp.linalg.norm(pf - pt)) < 2e-3, "position did not converge"
+    assert _ori_err_deg(qt, quatf) < 0.5, "orientation did not converge"
+    assert float(jnp.abs(jnp.diff(tr["qdd"], axis=0)).max()) < 1.0  # C2: no per-step chatter
+
+
+def test_pose_points_rotation_speed_scales_with_radius(prov):
+    # The B2 payoff: the jack radius r is the rotation/translation SPEED-BALANCE knob. A LARGER r gives the
+    # rotation DOF more metric priority (∝ r²) so the attractor wins against posture/damping → faster AND
+    # better-converged rotation, while TRANSLATION speed stays r-independent — the decoupling the coupled
+    # twist's single shared f_max could not provide. (Empirically rotation ↑ with r up to a plateau ~0.3–0.5;
+    # the metric competition dominates the idealized 1/r saturated-cruise effect over the useful range.)
+    nq = prov.nq
+    q0 = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    p0, quat0 = prov.site_pose(q0)
+    axis = jnp.array([0.3, 0.4, 0.85]); axis = axis / jnp.linalg.norm(axis)
+    R0 = jaxlie.SO3.from_quaternion_xyzw(jnp.concatenate([quat0[1:], quat0[:1]]))
+    xyzw = (jaxlie.SO3.exp(axis * 1.0) @ R0).as_quaternion_xyzw()
+    qt = jnp.concatenate([xyzw[3:], xyzw[:3]])                    # +1.0 rad in place, wxyz
+
+    def peaks(r):
+        fab = _points_fabric(prov, jnp.float64, control_point_jack(r), f_max=10.0)
+        rot = rollout(fab.policy, q0, jnp.zeros(nq),
+                      FabricParams(target=p0, q_default=q0, target_quat=qt), 0.002, 4000, prov.site_pos)
+        trn = rollout(fab.policy, q0, jnp.zeros(nq),
+                      FabricParams(target=p0 + jnp.array([0.0, 0.0, 0.12]), q_default=q0, target_quat=quat0),
+                      0.002, 4000, prov.site_pos)
+        assert bool(jnp.all(jnp.isfinite(rot["qdd"]))) and bool(jnp.all(jnp.isfinite(trn["qdd"])))
+        pv = float(jnp.max(jnp.linalg.norm(jnp.diff(trn["ee"], axis=0), axis=1)) / 0.002)
+        return _peak_ang_speed(prov, rot["q"], 0.002), pv
+
+    (w_small, v_small), (w_large, v_large) = peaks(0.05), peaks(0.20)
+    assert w_large > 1.5 * w_small, f"larger r must rotate faster: r=.20 {w_large:.2f} vs r=.05 {w_small:.2f} rad/s"
+    assert abs(v_large - v_small) < 0.15 * v_small, f"translation must be ~r-independent: {v_small:.3f} {v_large:.3f}"
+
+
+def test_pose_points_dynamic_mass_kills_leak(prov):
+    # D1 carries over to the points leaf, now on a pure-meters ‖e‖: a posture(weight=2) leaf biases the
+    # constant-mass equilibrium; a high near-goal m_max restores sub-mm convergence (no worse than const).
+    nq = prov.nq
+    q0 = jnp.asarray(prov.mj_model.key_qpos[0, :nq])
+    q_goal = q0 + jnp.asarray([0.4, -0.5, 0.3, 0.4, -0.3, 0.5, -0.4])
+    pt, qt = prov.site_pose(q_goal)
+    params = FabricParams(target=pt, q_default=q0, target_quat=qt)
+    offs = control_point_jack(0.1)
+
+    def tail_err(att):
+        fab = GeometricFabric(forcing=[att, posture(nq, weight=2.0)],
+                              damping=[config_damping(nq, b=6.0)], energy=fixed_metric_energy(nq, jnp.float64))
+        tr = rollout(fab.policy, q0, jnp.zeros(nq), params, 0.002, 6000, prov.site_pos)
+        assert bool(jnp.all(jnp.isfinite(tr["qdd"])))
+        return float(jnp.linalg.norm(tr["ee"][-500:] - pt, axis=1).mean())
+
+    const_err = tail_err(pose_points_attractor(prov, offs, f_max=20.0))
+    dyn_err = tail_err(pose_points_attractor(prov, offs, f_max=20.0, m_max=300.0, sharp=20.0, offset=0.1))
+    assert dyn_err < 1e-3, f"dynamic mass should converge sub-mm: {dyn_err*1e3:.2f} mm"
+    assert dyn_err <= const_err + 1e-4, f"dynamic {dyn_err*1e3:.2f} mm should be ≤ constant {const_err*1e3:.2f} mm"
+
+
+def test_pose_points_float32_finite(prov32):
+    # float32 deployment path stays finite and makes progress (no SE(3) log threshold to blow up).
+    nq = prov32.nq
+    q0 = jnp.asarray(prov32.mj_model.key_qpos[0, :nq], jnp.float32)
+    pt, qt = prov32.site_pose(q0 + 0.3)
+    fab = _points_fabric(prov32, jnp.float32, control_point_jack(0.1), f_max=20.0)
+    params = FabricParams(target=pt, q_default=q0, target_quat=qt)
+    tr = rollout(fab.policy, q0, jnp.zeros(nq, jnp.float32), params, 0.002, 1000, prov32.site_pos)
+    assert bool(jnp.all(jnp.isfinite(tr["q"])))
+    start = float(jnp.linalg.norm(prov32.site_pos(q0) - pt))
+    assert float(jnp.linalg.norm(tr["ee"][-1] - pt)) < start, "made no progress toward the target"
+
+
+def test_pose_points_latency_guard(prov32):
+    nq = prov32.nq
+    fab = _points_fabric(prov32, jnp.float32, control_point_jack(0.1), f_max=20.0)
+    qz = jnp.zeros(nq, jnp.float32)
+    pt, qt = prov32.site_pose(qz + 0.2)
+    p = FabricParams(target=pt, q_default=qz, target_quat=qt)
+    fab.policy(qz, qz, p).block_until_ready()
+    ts = []
+    for _ in range(500):
+        s = time.perf_counter(); fab.policy(qz, qz, p).block_until_ready(); ts.append(time.perf_counter() - s)
+    us = min(ts) * 1e6
+    assert us < 350.0, f"pose-points policy {us:.0f} us"  # 7-point FK, no SE(3) log; expect ≲ the twist path

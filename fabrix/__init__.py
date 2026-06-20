@@ -19,10 +19,12 @@ from fabrix.geometry import (
 from fabrix.integrate import limit_accel, limit_jerk, rollout, step
 from fabrix.kinematics import CustomFK, KinematicsProvider
 from fabrix.leaves import (
-    attractor, config_damping, cspace_attractor, pose_attractor, posture, speed_control,
+    attractor, config_damping, cspace_attractor, pose_attractor, pose_points_attractor, posture,
+    speed_control,
 )
 from fabrix.maps import (
-    plane_sdf_map, se3_pose_error_map, site_position_map, sphere_sdf_map,
+    control_point_jack, control_points_error_map, plane_sdf_map, se3_pose_error_map,
+    site_position_map, sphere_sdf_map,
 )
 from fabrix.spec import Spec, combine, dynamic_gain, pullback, resolve
 
@@ -31,7 +33,9 @@ __all__ = [
     "value_jac_curv",
     "KinematicsProvider", "CustomFK",
     "site_position_map", "sphere_sdf_map", "plane_sdf_map", "se3_pose_error_map",
-    "attractor", "pose_attractor", "posture", "cspace_attractor", "config_damping", "speed_control",
+    "control_points_error_map", "control_point_jack",
+    "attractor", "pose_attractor", "pose_points_attractor", "posture", "cspace_attractor",
+    "config_damping", "speed_control",
     "energy_spec", "fixed_metric_energy", "lagrangian_energy",
     "energize", "joint_limit_geometry", "joint_limit_potential", "joint_speed_limit",
     "obstacle_geometry", "obstacle_potential", "plane_geometry", "plane_potential",

@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 
 from fabrix.diff import value_jac_curv
-from fabrix.maps import se3_pose_error_map, site_position_map
+from fabrix.maps import control_points_error_map, se3_pose_error_map, site_position_map
 from fabrix.spec import Spec, dynamic_gain, pullback
 
 
@@ -114,6 +114,42 @@ def pose_attractor(provider, k: float = 16.0, b: float = 8.0, m: float = 50.0,
         m_min_, sh_, of_ = (dynamic_gain(g, params) for g in (m, sharp, offset))
         m_ = _scaled_mass(e, m_min_, mmax_, sh_, of_)
         M = m_ * jnp.eye(6, dtype=e.dtype)
+        f = m_ * (_restoring(e, k_, fm_) + b_ * ed)  # = -M @ a_des
+        return pullback(Spec(M, f), J, Jdq)
+
+    return leaf
+
+
+def pose_points_attractor(provider, offsets, k: float = 16.0, b: float = 8.0, m: float = 50.0,
+                          f_max: Optional[float] = None, m_max=None, sharp: float = 10.0,
+                          offset: float = 0.1):
+    """Full 6-DOF pose attractor via rigid CONTROL POINTS — the NVlabs/FABRICS construction.
+
+    A drop-in alternative to :func:`pose_attractor` that avoids the SE(3) twist entirely. Tracks ``P≥3``
+    rigid points on the EE (``offsets``: a ``(P,3)`` local jack, e.g. :func:`maps.control_point_jack`)
+    via :func:`maps.control_points_error_map` — a purely **positional** attractor over the stacked
+    ``(3P,)`` error, ALL in meters. Desired accel ``-(g(e) + b·ė)``; priority metric ``m(‖e‖)·I₃ₚ``.
+
+    Why this over the coupled twist (:func:`pose_attractor`): one uniform metric/gain/``f_max``/``offset``
+    over consistent (meter) units — no mixed (m, rad) scales — so the rotation/translation speed balance
+    becomes the geometric point radius ``r`` of the jack (in saturation ``v_trans ≈ f_max/b`` is
+    ``r``-independent while ``ω_rot ≈ f_max/(b·r)``, so the two are tuned independently) instead of a
+    single shared twist cap that throttled rotation to ``f_max/b`` rad/s. ``g`` is the restoring force
+    (quadratic, or gradient-saturating capped at ``f_max``); ``m_max`` enables the distance-scaled mass
+    (:func:`_scaled_mass`) on the now pure-meters ``‖e‖`` (cleaner than the twist's mixed-units ``‖e‖``).
+    Reuses the position-attractor machinery unchanged. Pair with :func:`posture`/:func:`speed_control` to
+    resolve redundancy; ``m_max=None`` (default) → the constant ``m``.
+    """
+    offs = jnp.asarray(offsets)
+
+    def leaf(q, qd, params):
+        phi = control_points_error_map(provider, params.target, params.target_quat, offs)
+        e, J, Jdq = value_jac_curv(phi, q, qd)
+        ed = J @ qd
+        k_, b_, fm_, mmax_ = (dynamic_gain(g, params) for g in (k, b, f_max, m_max))
+        m_min_, sh_, of_ = (dynamic_gain(g, params) for g in (m, sharp, offset))
+        m_ = _scaled_mass(e, m_min_, mmax_, sh_, of_)
+        M = m_ * jnp.eye(e.shape[0], dtype=e.dtype)
         f = m_ * (_restoring(e, k_, fm_) + b_ * ed)  # = -M @ a_des
         return pullback(Spec(M, f), J, Jdq)
 
